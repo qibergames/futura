@@ -8,7 +8,7 @@ java {
 }
 
 group = "com.atlas"
-version = "1.0-SNAPSHOT"
+version = System.getenv("VERSION") ?: "1.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
