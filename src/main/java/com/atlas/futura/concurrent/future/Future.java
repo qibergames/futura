@@ -1940,6 +1940,35 @@ public class Future<T> implements Promise<T> {
     }
 
     /**
+     * Convert this Future to a Java {@link CompletableFuture}.
+     * <p>
+     * The returned CompletableFuture will be completed when this Future is completed.
+     * If this Future is already completed, the CompletableFuture will be completed immediately.
+     * <p>
+     * If this Future fails, the CompletableFuture will be completed exceptionally.
+     *
+     * @return a new CompletableFuture
+     */
+    public @NotNull CompletableFuture<T> toJavaFuture() {
+        CompletableFuture<T> future = new CompletableFuture<>();
+        synchronized (lock) {
+            // check if the Future is already completed
+            if (completed) {
+                if (failed)
+                    future.completeExceptionally(error);
+                else
+                    future.complete(value);
+                return future;
+            }
+
+            // handle pending Future completion
+            completionHandlers.add(future::complete);
+            errorHandlers.add(future::completeExceptionally);
+        }
+        return future;
+    }
+
+    /**
      * Perform a task whilst the value is locked.
      *
      * @param task the task to perform
@@ -2589,7 +2618,7 @@ public class Future<T> implements Promise<T> {
      * @param futures the futures to wait for
      * @return a new Future
      */
-    public static Future<Void> all(@NotNull Future<?>... futures) {
+    public static @NotNull Future<Void> all(@NotNull Future<?>... futures) {
         Future<Void> future = new Future<>();
         AtomicInteger counter = new AtomicInteger(futures.length);
 
@@ -2613,7 +2642,7 @@ public class Future<T> implements Promise<T> {
      * @param futures the futures to wait for
      * @return a new Future
      */
-    public static Future<Void> all(@NotNull Collection<Future<?>> futures) {
+    public static @NotNull Future<Void> all(@NotNull Collection<Future<?>> futures) {
         return all(futures.toArray(new Future[0]));
     }
 
@@ -2661,5 +2690,27 @@ public class Future<T> implements Promise<T> {
 
         // unable to resolve the executor, return the global executor instead
         return globalExecutor;
+    }
+
+    /**
+     * Convert a Java {@link CompletableFuture} to a Future.
+     * <p>
+     * The returned Future will be completed when the CompletableFuture is completed.
+     * If the CompletableFuture is already completed, the Future will be completed immediately.
+     * <p>
+     * If the CompletableFuture fails, the Future will be completed with the same exception.
+     *
+     * @param future the CompletableFuture to convert
+     * @return a new Future
+     * @param <T> the type of the Future
+     */
+    public static <T> @NotNull Future<T> fromJavaFuture(@NotNull CompletableFuture<T> future) {
+        Future<T> newFuture = new Future<>();
+        future.thenAccept(newFuture::complete);
+        future.exceptionally(throwable -> {
+            newFuture.fail(throwable);
+            return null;
+        });
+        return newFuture;
     }
 }
