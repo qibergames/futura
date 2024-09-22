@@ -23,6 +23,9 @@ dependencies {
     compileOnly("org.jetbrains:annotations:24.0.1")
     testCompileOnly("org.jetbrains:annotations:24.0.1")
 
+    compileOnly("com.google.guava:guava:33.0.0-jre")
+    testCompileOnly("com.google.guava:guava:33.0.0-jre")
+
     testImplementation(platform("org.junit:junit-bom:5.10.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
 }
