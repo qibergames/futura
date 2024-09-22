@@ -1,0 +1,32 @@
+name: Semantic Release
+
+# This pipeline should be triggered manually. It will automatically generate a new version based on the changes
+# in the repository since the last release. This pipeline will update the `CHANGELOG.md` file, create a new tag,
+# and trigger the `publish.yml` pipeline to publish the new version to GitHub Packages.
+
+on:
+    workflow_dispatch:
+jobs:
+    release:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            pull-requests: write
+            packages: write
+
+        steps:
+            -   uses: actions/checkout@v4
+                with:
+                    fetch-depth: 0
+                    token: ${{ secrets.GH_PAT }}
+            -   uses: oven-sh/setup-bun@v1
+                with:
+                    bun-version: latest
+            -   name: Use Node.js
+                uses: actions/setup-node@v4
+                with:
+                    node-version: '20.x'
+            -   run: bun install
+            -   run: bun semantic-release
+                env:
+                    GITHUB_TOKEN: ${{ secrets.GH_PAT }}
