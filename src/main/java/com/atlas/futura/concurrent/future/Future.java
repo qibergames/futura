@@ -1,6 +1,10 @@
 package com.atlas.futura.concurrent.future;
 
 import com.atlas.futura.concurrent.threading.Threading;
+import com.atlas.futura.function.ThrowableConsumer;
+import com.atlas.futura.function.ThrowableFunction;
+import com.atlas.futura.function.ThrowableRunnable;
+import com.atlas.futura.function.ThrowableSupplier;
 import com.google.common.collect.MapMaker;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.errorprone.annotations.CheckReturnValue;
