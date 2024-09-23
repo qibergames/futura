@@ -148,3 +148,20 @@ Future<User> getUserById(long userId) {
     });
 }
 ```
+
+### Joining multiple Futures
+
+You may have different Futures that you want to join into one Future.
+
+```java
+void joinFutures() {
+    Future
+        .all(
+            doSomethingAsync(),
+            doSomethingElseAsync(),
+            doAnotherThingAsync()
+        )
+        .then(v -> System.out.println("all futures have completed"))
+        .except(e -> System.out.println("at least on of the futures have failed: " + e));
+}
+```
