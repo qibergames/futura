@@ -165,3 +165,33 @@ void joinFutures() {
         .except(e -> System.out.println("at least on of the futures have failed: " + e));
 }
 ```
+
+## API Semantics
+
+Future methods follow a convention to make usage more intuitive and developer-friendly.
+<br>
+
+Methods with the suffix `Async` indicates, that the method will implicitly run the operation on another thread.
+You can safely assume that any other method will execute the operation synchronously, on the caller thread.
+```java
+Future<Integer> myMethod() {
+    System.out.println("This will run on the caller thread");
+    Future.tryCompleteAsync(() -> System.out.println("This will run on another thread"));
+}
+```
+
+Methods with the prefix `try` indicates, that the method will capture exceptions and return a Future that will fail if the operation fails.
+Any other method will not guarantee to not throw an exception, and you should handle the exception immediately.
+```java
+Future<Integer> myMethod() {
+    // this Future will not capture any exceptions caused by `heavyOperationMayThrow`
+    // if it throws, `myMethod` will throw as well a runtime exception
+    return Future.completeAsync(() -> heavyOperationMayThrow());
+}
+
+Future<Integer> myOtherMethod() {
+    // if `heavyOperationMayThrow` throws, the exception will be captured by the Future, and the Future will fail
+    // this way `myOtherMethod` guarantees not to throw a runtime exception
+    return Future.tryCompleteAsync(() -> heavyOperationMayThrow());
+}
+```
