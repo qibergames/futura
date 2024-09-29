@@ -59,7 +59,6 @@ public interface Promise<T> extends Callback<T> {
      *
      * @see #get()
      */
-    @SneakyThrows
     @CanIgnoreReturnValue
     T await();
 

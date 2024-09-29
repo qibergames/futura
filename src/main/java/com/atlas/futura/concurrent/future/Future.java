@@ -1988,6 +1988,7 @@ public class Future<T> implements Promise<T> {
      *
      * @param value the completion result
      * @param <T> the type of the Future
+     *
      * @return a new, completed Future
      */
     @CheckReturnValue
@@ -2005,13 +2006,12 @@ public class Future<T> implements Promise<T> {
     /**
      * Create a new Future, that is completed without a specified value.
      *
-     * @param <T> the type of the Future
      * @return a new, completed Future
      */
     @CheckReturnValue
-    public static <T> @NotNull Future<T> completed() {
+    public static @NotNull Future<Void> completed() {
         // create a new empty Future
-        Future<T> future = new Future<>();
+        Future<Void> future = new Future<>();
 
         // set the future state
         future.completed = true;
@@ -2087,7 +2087,6 @@ public class Future<T> implements Promise<T> {
             }
         });
         return future;
-
     }
 
     /**
@@ -2293,7 +2292,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static @NotNull Future<Void> tryCompleteAsync(@NotNull ThrowableRunnable<Throwable> task) {
+    public static @NotNull Future<Void> tryRunAsync(@NotNull ThrowableRunnable<Throwable> task) {
         // create an empty future
         Future<Void> future = new Future<>();
 
@@ -2325,7 +2324,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static @NotNull Future<Void> completeAsync(@NotNull Runnable task, @NotNull Executor executor) {
+    public static @NotNull Future<Void> runAsync(@NotNull Runnable task, @NotNull Executor executor) {
         // create an empty future
         Future<Void> future = new Future<>();
 
@@ -2355,7 +2354,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static @NotNull Future<Void> completeAsync(
+    public static @NotNull Future<Void> runAsync(
         @NotNull ThrowableRunnable<Throwable> task, @NotNull Executor executor
     ) {
         // create an empty future
@@ -2400,14 +2399,14 @@ public class Future<T> implements Promise<T> {
      * <p>
      * If the action throws an exception, the Future will be completed with the exception.
      * <p>
+     * If the action completes successfully, the Future will be completed with a <code>null</code> value.
      *
      * @param action the task to try to complete
      * @return a new Future
-     * @param <T> the type of the Future
      */
     @CanIgnoreReturnValue
-    public static <T> @NotNull Future<T> tryComplete(@NotNull ThrowableRunnable<Throwable> action) {
-        Future<T> future = new Future<>();
+    public static @NotNull Future<Void> tryRun(@NotNull ThrowableRunnable<Throwable> action) {
+        Future<Void> future = new Future<>();
 
         try {
             action.run();
