@@ -1,4 +1,4 @@
-package com.atlas.futura.concurrent.threading;
+package com.qibergames.futura.concurrent.threading;
 
 import org.jetbrains.annotations.NotNull;
 

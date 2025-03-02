@@ -1,4 +1,4 @@
-package com.atlas.futura.function;
+package com.qibergames.futura.function;
 
 import org.jetbrains.annotations.NotNull;
 
@@ -46,7 +46,7 @@ public interface ThrowableSupplier<T, E extends Throwable> {
      *
      * @param <T> the type of the result
      * @param <E> the type of the exception
-     * 
+     *
      * @return the throwable supplier representation
      */
     static <T, E extends Throwable> @NotNull ThrowableSupplier<T, E> fomSupplier(@NotNull Supplier<T> supplier) {

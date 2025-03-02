@@ -1,11 +1,11 @@
-package com.atlas.futura.concurrent.future;
+package com.qibergames.futura.concurrent.future;
 
-import com.atlas.futura.concurrent.threading.Threading;
-import com.atlas.futura.function.ThrowableConsumer;
-import com.atlas.futura.function.ThrowableFunction;
-import com.atlas.futura.function.ThrowableRunnable;
-import com.atlas.futura.function.ThrowableSupplier;
-import com.atlas.futura.util.Validator;
+import com.qibergames.futura.concurrent.threading.Threading;
+import com.qibergames.futura.function.ThrowableConsumer;
+import com.qibergames.futura.function.ThrowableFunction;
+import com.qibergames.futura.function.ThrowableRunnable;
+import com.qibergames.futura.function.ThrowableSupplier;
+import com.qibergames.futura.util.Validator;
 import com.google.common.collect.MapMaker;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.errorprone.annotations.CheckReturnValue;

@@ -1,4 +1,4 @@
-package com.atlas.futura.data.convertible;
+package com.qibergames.futura.data.convertible;
 
 import com.google.errorprone.annotations.CheckReturnValue;
 import org.jetbrains.annotations.NotNull;

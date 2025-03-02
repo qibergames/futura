@@ -1,8 +1,7 @@
-package com.atlas.futura.concurrent.future;
+package com.qibergames.futura.concurrent.future;
 
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.errorprone.annotations.CheckReturnValue;
-import lombok.SneakyThrows;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
