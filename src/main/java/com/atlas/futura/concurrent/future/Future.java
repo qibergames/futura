@@ -17,6 +17,7 @@ import org.jetbrains.annotations.Nullable;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.*;
@@ -140,6 +141,34 @@ public class Future<T> implements Promise<T> {
         try {
             // wait for the future completion without specifying a timeout
             return blockForValue(0, false, null);
+        } catch (FutureTimeoutException e) {
+            // this should not happen
+            throw new IllegalStateException("Timeout should have been avoided", e);
+        }
+    }
+
+    /**
+     * Block the current thread and wait for the Future completion to happen.
+     * After the completion happened, the completion result T object is returned wrapped with an {@link Optional}.
+     * <p>
+     * If the Future fails to complete, or the completion value is {@code null}, an {@link Optional#empty()} is
+     * returned.
+     * <p>
+     * An {@link Optional#of(Object)} is returned if and only if the Future completes successfully, and the completion
+     * value is not {@code null}.
+     *
+     * @return an optional of T holding the completion value, or an empty optional
+     */
+    @CheckReturnValue
+    public @NotNull Optional<T> tryGet() {
+        try {
+            // note that future can complete with `null`, for instance when running `Future<Void>.completed()`
+            // java optional api enforces optional values not to be null, so for completed null values, we
+            // will return an empty optional as well
+            T value = blockForValue(0, false, null);
+            return value != null ? Optional.of(value) : Optional.empty();
+        } catch (FutureExecutionException e) {
+            return Optional.empty();
         } catch (FutureTimeoutException e) {
             // this should not happen
             throw new IllegalStateException("Timeout should have been avoided", e);
@@ -373,12 +402,37 @@ public class Future<T> implements Promise<T> {
 
     /**
      * Get instantly the completion value or the default value if the Future hasn't been completed yet.
+     *
      * @param defaultValue default value to return if the Future isn't completed
      * @return the completion value or the default value
      */
     @CheckReturnValue
     public T getNow(@Nullable T defaultValue) {
         return completed ? value : defaultValue;
+    }
+
+    /**
+     * Attempt to instantly get the completion value of the Future.
+     * <p>
+     * If the Future hasn't been completed yet, an {@link Optional#empty()} is returned.
+     * <p>
+     * If the Future is already completed, but the completion values is {@code null}, an {@link Optional#empty()}
+     * is returned.
+     * <p>
+     * An {@link Optional#of(Object)} is returned if and only if the Future is completed and the completion value
+     * is not {@code null}.
+     *
+     * @return an optional of T holding the completion value, or an empty optional
+     */
+    @CheckReturnValue
+    public @NotNull Optional<T> tryGetNow() {
+        T value = this.value;
+        // note that future can complete with `null`, for instance when running `Future<Void>.completed()`
+        // java optional api enforces optional values not to be null, so for completed null values, we
+        // will return an empty optional as well
+        if (value == null)
+            return Optional.empty();
+        return completed ? Optional.of(value) : Optional.empty();
     }
 
     /**
