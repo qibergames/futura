@@ -17,6 +17,7 @@ import org.jetbrains.annotations.Nullable;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.*;
@@ -140,6 +141,34 @@ public class Future<T> implements Promise<T> {
         try {
             // wait for the future completion without specifying a timeout
             return blockForValue(0, false, null);
+        } catch (FutureTimeoutException e) {
+            // this should not happen
+            throw new IllegalStateException("Timeout should have been avoided", e);
+        }
+    }
+
+    /**
+     * Block the current thread and wait for the Future completion to happen.
+     * After the completion happened, the completion result T object is returned wrapped with an {@link Optional}.
+     * <p>
+     * If the Future fails to complete, or the completion value is {@code null}, an {@link Optional#empty()} is
+     * returned.
+     * <p>
+     * An {@link Optional#of(Object)} is returned if and only if the Future completes successfully, and the completion
+     * value is not {@code null}.
+     *
+     * @return an optional of T holding the completion value, or an empty optional
+     */
+    @CheckReturnValue
+    public @NotNull Optional<T> tryGet() {
+        try {
+            // note that future can complete with `null`, for instance when running `Future<Void>.completed()`
+            // java optional api enforces optional values not to be null, so for completed null values, we
+            // will return an empty optional as well
+            T value = blockForValue(0, false, null);
+            return value != null ? Optional.of(value) : Optional.empty();
+        } catch (FutureExecutionException e) {
+            return Optional.empty();
         } catch (FutureTimeoutException e) {
             // this should not happen
             throw new IllegalStateException("Timeout should have been avoided", e);
@@ -373,12 +402,35 @@ public class Future<T> implements Promise<T> {
 
     /**
      * Get instantly the completion value or the default value if the Future hasn't been completed yet.
+     *
      * @param defaultValue default value to return if the Future isn't completed
      * @return the completion value or the default value
      */
     @CheckReturnValue
     public T getNow(@Nullable T defaultValue) {
         return completed ? value : defaultValue;
+    }
+
+    /**
+     * Attempt to instantly get the completion value of the Future.
+     * <p>
+     * If the Future hasn't been completed yet, an {@link Optional#empty()} is returned.
+     * <p>
+     * If the Future is already completed, but the completion values is {@code null}, an {@link Optional#empty()}
+     * is returned.
+     * <p>
+     * An {@link Optional#of(Object)} is returned if and only if the Future is completed and the completion value
+     * is not {@code null}.
+     *
+     * @return an optional of T holding the completion value, or an empty optional
+     */
+    @CheckReturnValue
+    public @NotNull Optional<T> tryGetNow() {
+        T value = this.value;
+        // note that future can complete with `null`, for instance when running `Future<Void>.completed()`
+        // java optional api enforces optional values not to be null, so for completed null values, we
+        // will return an empty optional as well
+        return completed && value != null ? Optional.of(value) : Optional.empty();
     }
 
     /**
@@ -803,8 +855,8 @@ public class Future<T> implements Promise<T> {
      * @param transformer the function that transforms the value from T to U
      * @param <U> the new Future type
      * @return a new Future of type U
-     * 
-     * @see #chain(Future) 
+     *
+     * @see #chain(Future)
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> transformAsync(@NotNull Function<T, Future<U>> transformer) {
@@ -1066,7 +1118,7 @@ public class Future<T> implements Promise<T> {
             Future<U> future = new Future<>();
 
             // supply the value when this Future completes
-            completionHandlers.add(ignored -> Future.completeAsync(supplier).then(future::complete));
+            completionHandlers.add(ignored -> Future.supplyAsync(supplier).then(future::complete));
 
             // proxy the error to the new Future
             errorHandlers.add(future::fail);
@@ -1111,7 +1163,7 @@ public class Future<T> implements Promise<T> {
             Future<U> future = new Future<>();
 
             // try to supply the value when this Future completes
-            completionHandlers.add(ignored -> Future.tryCompleteAsync(supplier)
+            completionHandlers.add(ignored -> Future.trySupplyAsync(supplier)
                 .then(future::complete)
                 .except(future::fail));
 
@@ -1879,7 +1931,7 @@ public class Future<T> implements Promise<T> {
      * @param other the Future to complete after this Future completes
      * @return a new Future that will be completed when this- and the other Future completes
      * @param <U> the type of the other future
-     *           
+     *
      * @see #transformAsync(Function)
      */
     @CheckReturnValue
@@ -1988,6 +2040,7 @@ public class Future<T> implements Promise<T> {
      *
      * @param value the completion result
      * @param <T> the type of the Future
+     *
      * @return a new, completed Future
      */
     @CheckReturnValue
@@ -2005,13 +2058,12 @@ public class Future<T> implements Promise<T> {
     /**
      * Create a new Future, that is completed without a specified value.
      *
-     * @param <T> the type of the Future
      * @return a new, completed Future
      */
     @CheckReturnValue
-    public static <T> @NotNull Future<T> completed() {
+    public static @NotNull Future<Void> completed() {
         // create a new empty Future
-        Future<T> future = new Future<>();
+        Future<Void> future = new Future<>();
 
         // set the future state
         future.completed = true;
@@ -2065,7 +2117,7 @@ public class Future<T> implements Promise<T> {
      * then some callbacks might be executed on the current thread.
      * Therefore, make sure to register the callbacks to this Future first.
      * <p>
-     * If the result object is not a constant, consider using {@link #completeAsync(Supplier, Executor)} instead,
+     * If the result object is not a constant, consider using {@link #supplyAsync(Supplier, Executor)} instead,
      * as it does allow dynamic object creation.
      *
      * @param result the value that is used to complete the Future with
@@ -2087,7 +2139,6 @@ public class Future<T> implements Promise<T> {
             }
         });
         return future;
-
     }
 
     /**
@@ -2106,7 +2157,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static <T> @NotNull Future<T> completeAsync(@NotNull Supplier<T> result, @NotNull Executor executor) {
+    public static <T> @NotNull Future<T> supplyAsync(@NotNull Supplier<T> result, @NotNull Executor executor) {
         // create an empty future
         Future<T> future = new Future<>();
 
@@ -2137,7 +2188,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static <T> @NotNull Future<T> tryCompleteAsync(
+    public static <T> @NotNull Future<T> trySupplyAsync(
         @NotNull ThrowableSupplier<T, Throwable> result, @NotNull Executor executor
     ) {
         // create an empty future
@@ -2162,7 +2213,7 @@ public class Future<T> implements Promise<T> {
      * then some callbacks might be executed on the current thread.
      * Therefore, make sure to register the callbacks to this Future first.
      * <p>
-     * If the result object is not a constant, consider using {@link #completeAsync(Supplier)} instead,
+     * If the result object is not a constant, consider using {@link #supplyAsync(Supplier)} instead,
      * as it does allow dynamic object creation.
      *
      * @param result the value that is used to complete the Future with
@@ -2201,7 +2252,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static <T> @NotNull Future<T> completeAsync(@NotNull Supplier<T> result) {
+    public static <T> @NotNull Future<T> supplyAsync(@NotNull Supplier<T> result) {
         // create an empty future
         Future<T> future = new Future<>();
 
@@ -2232,7 +2283,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static <T> @NotNull Future<T> tryCompleteAsync(@NotNull ThrowableSupplier<T, Throwable> result) {
+    public static <T> @NotNull Future<T> trySupplyAsync(@NotNull ThrowableSupplier<T, Throwable> result) {
         // create an empty future
         Future<T> future = new Future<>();
 
@@ -2263,7 +2314,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static @NotNull Future<Void> completeAsync(@NotNull Runnable task) {
+    public static @NotNull Future<Void> invokeAsync(@NotNull Runnable task) {
         // create an empty future
         Future<Void> future = new Future<>();
 
@@ -2293,7 +2344,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static @NotNull Future<Void> tryCompleteAsync(@NotNull ThrowableRunnable<Throwable> task) {
+    public static @NotNull Future<Void> tryInvokeAsync(@NotNull ThrowableRunnable<Throwable> task) {
         // create an empty future
         Future<Void> future = new Future<>();
 
@@ -2325,7 +2376,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static @NotNull Future<Void> completeAsync(@NotNull Runnable task, @NotNull Executor executor) {
+    public static @NotNull Future<Void> invokeAsync(@NotNull Runnable task, @NotNull Executor executor) {
         // create an empty future
         Future<Void> future = new Future<>();
 
@@ -2355,7 +2406,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static @NotNull Future<Void> completeAsync(
+    public static @NotNull Future<Void> invokeAsync(
         @NotNull ThrowableRunnable<Throwable> task, @NotNull Executor executor
     ) {
         // create an empty future
@@ -2382,7 +2433,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public static <T> @NotNull Future<T> tryComplete(@NotNull ThrowableSupplier<T, Throwable> supplier) {
+    public static <T> @NotNull Future<T> trySupply(@NotNull ThrowableSupplier<T, Throwable> supplier) {
         Future<T> future = new Future<>();
 
         try {
@@ -2400,14 +2451,14 @@ public class Future<T> implements Promise<T> {
      * <p>
      * If the action throws an exception, the Future will be completed with the exception.
      * <p>
+     * If the action completes successfully, the Future will be completed with a <code>null</code> value.
      *
      * @param action the task to try to complete
      * @return a new Future
-     * @param <T> the type of the Future
      */
     @CanIgnoreReturnValue
-    public static <T> @NotNull Future<T> tryComplete(@NotNull ThrowableRunnable<Throwable> action) {
-        Future<T> future = new Future<>();
+    public static @NotNull Future<Void> tryInvoke(@NotNull ThrowableRunnable<Throwable> action) {
+        Future<Void> future = new Future<>();
 
         try {
             action.run();
