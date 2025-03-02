@@ -430,9 +430,7 @@ public class Future<T> implements Promise<T> {
         // note that future can complete with `null`, for instance when running `Future<Void>.completed()`
         // java optional api enforces optional values not to be null, so for completed null values, we
         // will return an empty optional as well
-        if (value == null)
-            return Optional.empty();
-        return completed ? Optional.of(value) : Optional.empty();
+        return completed && value != null ? Optional.of(value) : Optional.empty();
     }
 
     /**
