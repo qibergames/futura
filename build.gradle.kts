@@ -8,7 +8,7 @@ java {
     targetCompatibility = JavaVersion.VERSION_1_8
 }
 
-group = "com.atlas"
+group = "com.qibergames"
 version = System.getenv("VERSION") ?: "1.0-SNAPSHOT"
 
 repositories {
