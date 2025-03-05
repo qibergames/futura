@@ -5,7 +5,7 @@ import com.qibergames.futura.function.ThrowableConsumer;
 import com.qibergames.futura.function.ThrowableFunction;
 import com.qibergames.futura.function.ThrowableRunnable;
 import com.qibergames.futura.function.ThrowableSupplier;
-import com.qibergames.futura.util.Validator;
+import com.qibergames.futura.verification.Validator;
 import com.google.common.collect.MapMaker;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.errorprone.annotations.CheckReturnValue;
