@@ -2,10 +2,9 @@ package com.qibergames.futura.concurrent.atomic;
 
 import lombok.Getter;
 import org.jetbrains.annotations.NotNull;
-import sun.misc.Unsafe;
 
-import static com.qibergames.futura.concurrent.atomic.VarHandleSupport.UNSAFE;
 import java.lang.reflect.Field;
+import sun.misc.Unsafe;
 
 /**
  * Represents an implementation of {@link VarHandle} for legacy java runtimes, that utilise the {@link Unsafe} API.
@@ -39,7 +38,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
     public LegacyVarHandle(@NotNull Object handle, @NotNull Field field, boolean isStatic) {
         this.handle = handle;
         this.field = field;
-        this.offset = isStatic ? UNSAFE.staticFieldOffset(field) : UNSAFE.objectFieldOffset(field);
+        this.offset = isStatic ? VarHandleSupport.UNSAFE.staticFieldOffset(field) : VarHandleSupport.UNSAFE.objectFieldOffset(field);
     }
 
     /**
@@ -52,7 +51,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
     @SuppressWarnings("unchecked")
     public T get() {
         verifyHandle();
-        return (T) UNSAFE.getObject(handle, offset);
+        return (T) VarHandleSupport.UNSAFE.getObject(handle, offset);
     }
 
     /**
@@ -65,7 +64,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
     @Override
     @SuppressWarnings("unchecked")
     public T get(@NotNull Object handle) {
-        return (T) UNSAFE.getObject(handle, offset);
+        return (T) VarHandleSupport.UNSAFE.getObject(handle, offset);
     }
 
     /**
@@ -78,7 +77,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
     @SuppressWarnings("unchecked")
     public T getVolatile() {
         verifyHandle();
-        return (T) UNSAFE.getObjectVolatile(handle, offset);
+        return (T) VarHandleSupport.UNSAFE.getObjectVolatile(handle, offset);
     }
 
     /**
@@ -91,7 +90,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
     @Override
     @SuppressWarnings("unchecked")
     public T getVolatile(@NotNull Object handle) {
-        return (T) UNSAFE.getObjectVolatile(handle, offset);
+        return (T) VarHandleSupport.UNSAFE.getObjectVolatile(handle, offset);
     }
 
     /**
@@ -102,7 +101,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
      */
     public void set(T value) {
         verifyHandle();
-        UNSAFE.putObject(handle, offset, value);
+        VarHandleSupport.UNSAFE.putObject(handle, offset, value);
     }
 
     /**
@@ -114,7 +113,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
      */
     @Override
     public void set(@NotNull Object handle, T value) {
-        UNSAFE.putObject(handle, offset, value);
+        VarHandleSupport.UNSAFE.putObject(handle, offset, value);
     }
 
     /**
@@ -125,7 +124,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
      */
     public void setVolatile(T value) {
         verifyHandle();
-        UNSAFE.putObjectVolatile(handle, offset, value);
+        VarHandleSupport.UNSAFE.putObjectVolatile(handle, offset, value);
     }
 
     /**
@@ -137,7 +136,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
      */
     @Override
     public void setVolatile(@NotNull Object handle, T value) {
-        UNSAFE.putObjectVolatile(handle, offset, value);
+        VarHandleSupport.UNSAFE.putObjectVolatile(handle, offset, value);
     }
 
     /**
@@ -152,7 +151,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
     @Override
     public void setLazy(T value) {
         verifyHandle();
-        UNSAFE.putOrderedObject(handle, offset, value);
+        VarHandleSupport.UNSAFE.putOrderedObject(handle, offset, value);
     }
 
     /**
@@ -167,7 +166,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
      */
     @Override
     public void setLazy(@NotNull Object handle, T value) {
-        UNSAFE.putOrderedObject(handle, offset, value);
+        VarHandleSupport.UNSAFE.putOrderedObject(handle, offset, value);
     }
 
     /**
@@ -182,7 +181,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
      */
     public boolean compareAndSet(T expected, T update) {
         verifyHandle();
-        return UNSAFE.compareAndSwapObject(handle, offset, expected, update);
+        return VarHandleSupport.UNSAFE.compareAndSwapObject(handle, offset, expected, update);
     }
 
     /**
@@ -197,7 +196,7 @@ class LegacyVarHandle<T> implements VarHandle<T> {
      */
     @Override
     public boolean compareAndSet(@NotNull Object handle, T expected, T update) {
-        return UNSAFE.compareAndSwapObject(handle, offset, expected, update);
+        return VarHandleSupport.UNSAFE.compareAndSwapObject(handle, offset, expected, update);
     }
 
     /**

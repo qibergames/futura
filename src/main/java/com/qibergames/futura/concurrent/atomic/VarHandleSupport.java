@@ -19,7 +19,7 @@ class VarHandleSupport {
     /**
      * The singleton access to the {@link Unsafe} system.
      */
-    public final Unsafe UNSAFE;
+    public final Unsafe UNSAFE = getUnsafe();
 
     /**
      * Create a new {@link VarHandle} based on the underlying platform.
@@ -55,11 +55,11 @@ class VarHandleSupport {
     }
 
     // attempt to resolve the Unsafe instance
-    static {
+    private static @NotNull Unsafe getUnsafe() {
         try {
             Field field = Unsafe.class.getDeclaredField("theUnsafe");
             field.setAccessible(true);
-            UNSAFE = (Unsafe) field.get(null);
+            return (Unsafe) field.get(null);
         } catch (Exception e) {
             throw new RuntimeException("Failed to get Unsafe", e);
         }
