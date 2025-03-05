@@ -227,8 +227,8 @@ class LegacyVarHandle<T> implements VarHandle<T> {
     public T getAndSet(@NotNull Object handle, T newValue) {
         T prev;
         do {
-            prev = get();
-        } while (!compareAndSet(prev, newValue));
+            prev = get(handle);
+        } while (!compareAndSet(handle, prev, newValue));
         return prev;
     }
 
