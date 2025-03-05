@@ -1,4 +1,4 @@
-package com.atlas.futura.data.convertible;
+package com.qibergames.futura.data.convertible;
 
 import org.jetbrains.annotations.NotNull;
 

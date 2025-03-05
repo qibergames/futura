@@ -1,4 +1,4 @@
-package com.atlas.futura.function;
+package com.qibergames.futura.function;
 
 import org.jetbrains.annotations.NotNull;
 

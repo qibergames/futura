@@ -1,4 +1,4 @@
-package com.atlas.futura.util;
+package com.qibergames.futura.verification;
 
 import lombok.experimental.UtilityClass;
 import org.jetbrains.annotations.NotNull;

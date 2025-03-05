@@ -1,4 +1,4 @@
-package com.atlas.futura.concurrent.threading;
+package com.qibergames.futura.concurrent.threading;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import lombok.SneakyThrows;
