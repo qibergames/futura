@@ -637,7 +637,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public @NotNull Future<T> thenComplete(@NotNull Runnable task) {
+    public @NotNull Future<T> thenInvoke(@NotNull Runnable task) {
         synchronized (lock) {
             Future<T> future = new Future<>();
 
@@ -682,7 +682,7 @@ public class Future<T> implements Promise<T> {
      * @return a new Future
      */
     @CanIgnoreReturnValue
-    public @NotNull Future<T> thenTryComplete(@NotNull ThrowableRunnable<Throwable> task) {
+    public @NotNull Future<T> thenTryInvoke(@NotNull ThrowableRunnable<Throwable> task) {
         synchronized (lock) {
             Future<T> future = new Future<>();
 
