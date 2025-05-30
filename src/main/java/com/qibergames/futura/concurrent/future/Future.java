@@ -2733,6 +2733,8 @@ public class Future<T> implements Promise<T> {
 
     /**
      * Attempt to shut down all pending tasks submitted to Futures for this context.
+     * <p>
+     * If the context's executor has been already shut down, an empty list is returned.
      *
      * @param stackTrace the stack trace of the context to shut down at
      * @param force whether to force terminate running tasks
@@ -2742,34 +2744,50 @@ public class Future<T> implements Promise<T> {
     public static @NotNull List<Runnable> shutdownContext(
         @NotNull StackTraceElement @NotNull [] stackTrace, boolean force
     ) {
-        ExecutorService executor = getExecutor(stackTrace);
-        if (executor == globalExecutor)
-            return Collections.emptyList();
+        synchronized (contextExecutors) {
+            ExecutorService executor = getExecutor(stackTrace);
+            if (executor == globalExecutor)
+                return Collections.emptyList();
 
-        return force ? executor.shutdownNow() : Collections.emptyList();
+            if (executor.isShutdown())
+                return Collections.emptyList();
+
+            if (force)
+                return executor.shutdownNow();
+
+            executor.shutdown();
+            return Collections.emptyList();
+        }
     }
 
     /**
      * Attempt to shut down all pending tasks submitted to Futures.
+     * <p>
+     * If any executor is already shut down, it is ignored.
      *
      * @param force whether to force terminate running tasks
      * @return the list of pending tasks if force is {@code true}, an empty list otherwise
      */
     public static @NotNull List<Runnable> shutdown(boolean force) {
-        Set<ExecutorService> executors = new HashSet<>();
-        executors.add(globalExecutor);
-        executors.addAll(contextExecutors.values());
+        synchronized (contextExecutors) {
+            Set<ExecutorService> executors = new HashSet<>();
+            executors.add(globalExecutor);
+            executors.addAll(contextExecutors.values());
 
-        List<Runnable> tasks = new ArrayList<>();
+            List<Runnable> tasks = new ArrayList<>();
 
-        for (ExecutorService executor : executors) {
-            if (force)
-                tasks.addAll(executor.shutdownNow());
-            else
-                executor.shutdown();
+            for (ExecutorService executor : executors) {
+                if (executor.isShutdown())
+                    continue;
+
+                if (force)
+                    tasks.addAll(executor.shutdownNow());
+                else
+                    executor.shutdown();
+            }
+
+            contextExecutors.clear();
+            return tasks;
         }
-
-        contextExecutors.clear();
-        return tasks;
     }
 }
