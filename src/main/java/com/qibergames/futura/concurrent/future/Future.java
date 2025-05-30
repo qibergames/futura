@@ -9,15 +9,13 @@ import com.qibergames.futura.verification.Validator;
 import com.google.common.collect.MapMaker;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.errorprone.annotations.CheckReturnValue;
+import lombok.Getter;
 import lombok.Setter;
 import lombok.SneakyThrows;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.*;
@@ -51,14 +49,15 @@ public class Future<T> implements Promise<T> {
      * The global executor to be used for performing asynchronous tasks, where the executor is not specified explicitly.
      */
     @Setter
-    private static @NotNull Executor globalExecutor = Threading.createVirtualOrPool(
+    @Getter
+    private static @NotNull ExecutorService globalExecutor = Threading.createVirtualOrPool(
         Runtime.getRuntime().availableProcessors()
     );
 
     /**
      * The map of executors that should be used for the specified contexts.
      */
-    private static final @NotNull Map<@NotNull Object, @Nullable Executor> contextExecutors = new MapMaker()
+    private static final @NotNull Map<@NotNull Object, @Nullable ExecutorService> contextExecutors = new MapMaker()
         .weakKeys()
         .weakValues()
         .concurrencyLevel(4)
@@ -76,7 +75,7 @@ public class Future<T> implements Promise<T> {
      * {@link #contextKeyMapper} function.
      */
     @Setter
-    private static @NotNull Function<@NotNull Object, @Nullable Executor> contextExecutorMapper = key -> globalExecutor;
+    private static @NotNull Function<@NotNull Object, @Nullable ExecutorService> contextExecutorMapper = key -> globalExecutor;
 
     /**
      * The object used for thread locking for unsafe value modifications.
@@ -2671,7 +2670,7 @@ public class Future<T> implements Promise<T> {
      * @return the executor for the stack trace or the global executor
      */
     @CheckReturnValue
-    private static @NotNull Executor getExecutor(@NotNull StackTraceElement @NotNull [] stackTrace) {
+    private static @NotNull ExecutorService getExecutor(@NotNull StackTraceElement @NotNull [] stackTrace) {
         // validate that the class key and executor resolver functions are not set to null
         Validator.notNull(contextKeyMapper, "context key mapper");
         Validator.notNull(contextExecutorMapper, "context executor mapper");
@@ -2693,7 +2692,7 @@ public class Future<T> implements Promise<T> {
         Validator.notNull(key, "context key");
 
         // check if an executor is already cached for the key
-        Executor executor = contextExecutors.get(key);
+        ExecutorService executor = contextExecutors.get(key);
         if (executor != null)
             return executor;
 
@@ -2730,5 +2729,47 @@ public class Future<T> implements Promise<T> {
             return null;
         });
         return newFuture;
+    }
+
+    /**
+     * Attempt to shut down all pending tasks submitted to Futures for this context.
+     *
+     * @param stackTrace the stack trace of the context to shut down at
+     * @param force whether to force terminate running tasks
+     *
+     * @return the list of pending tasks if force is {@code true}, an empty list otherwise
+     */
+    public static @NotNull List<Runnable> shutdownContext(
+        @NotNull StackTraceElement @NotNull [] stackTrace, boolean force
+    ) {
+        ExecutorService executor = getExecutor(stackTrace);
+        if (executor == globalExecutor)
+            return Collections.emptyList();
+
+        return force ? executor.shutdownNow() : Collections.emptyList();
+    }
+
+    /**
+     * Attempt to shut down all pending tasks submitted to Futures.
+     *
+     * @param force whether to force terminate running tasks
+     * @return the list of pending tasks if force is {@code true}, an empty list otherwise
+     */
+    public static @NotNull List<Runnable> shutdown(boolean force) {
+        Set<ExecutorService> executors = new HashSet<>();
+        executors.add(globalExecutor);
+        executors.addAll(contextExecutors.values());
+
+        List<Runnable> tasks = new ArrayList<>();
+
+        for (ExecutorService executor : executors) {
+            if (force)
+                tasks.addAll(executor.shutdownNow());
+            else
+                executor.shutdown();
+        }
+
+        contextExecutors.clear();
+        return tasks;
     }
 }
