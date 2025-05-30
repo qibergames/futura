@@ -2735,6 +2735,8 @@ public class Future<T> implements Promise<T> {
      * Attempt to shut down all pending tasks submitted to Futures for this context.
      * <p>
      * If the context's executor has been already shut down, an empty list is returned.
+     * <p>
+     * If the executor of the specified context could not be resolved, the shut down request is ignored.
      *
      * @param stackTrace the stack trace of the context to shut down at
      * @param force whether to force terminate running tasks
