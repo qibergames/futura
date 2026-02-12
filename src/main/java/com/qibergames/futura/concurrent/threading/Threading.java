@@ -25,6 +25,21 @@ public class Threading {
         .build();
 
     /**
+     * The reflection method handle for {@link Thread#onSpinWait()}.
+     */
+    private static final Method ON_SPIN_WAIT;
+
+    static {
+        Method method;
+        try {
+            method = Thread.class.getMethod("onSpinWait");
+        } catch (NoSuchMethodException e) {
+            method = null;
+        }
+        ON_SPIN_WAIT = method;
+    }
+
+    /**
      * Create a virtual executor service, or a thread pool if virtual threads are not supported by the JVM
      * in the current environment.
      *
@@ -39,5 +54,23 @@ public class Threading {
         } catch (NoSuchMethodException e) {
             return Executors.newFixedThreadPool(poolSize, FACTORY);
         }
+    }
+
+    /**
+     * Hint to the runtime that the current thread is in a spin-wait loop.
+     * <p>
+     * Uses {@link Thread#onSpinWait()} when available (Java 9+), otherwise
+     * falls back to {@link Thread#yield()} for Java 8 compatibility.
+     */
+    public static void onSpinWait() {
+        if (ON_SPIN_WAIT != null) {
+            try {
+                ON_SPIN_WAIT.invoke(null);
+                return;
+            } catch (ReflectiveOperationException ignored) {
+                // fall through to yield
+            }
+        }
+        Thread.yield();
     }
 }

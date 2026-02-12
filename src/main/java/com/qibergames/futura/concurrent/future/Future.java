@@ -18,6 +18,9 @@ import org.jetbrains.annotations.Nullable;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.*;
 
 /**
@@ -78,28 +81,40 @@ public class Future<T> implements Promise<T> {
     private static @NotNull Function<Object, ExecutorService> contextExecutorMapper = key -> globalExecutor;
 
     /**
-     * State enumeration for Future lifecycle management.
+     * Represents the current state of the Future's lifecycle.
      */
     private enum State {
-        PENDING,
-        COMPLETED,
-        FAILED
+        PENDING, // Future is waiting for a completion request.
+        COMPLETING, // Received a completion request, processing lifecycle change.
+        FAILING, // Received a failure request, processing lifecycle change.
+        COMPLETED, // Handled successful completion, invoking completion handlers.
+        FAILED  // Handled failed completion, invoking failure handlers.
     }
 
     /**
-     * The object used for thread locking for unsafe value modifications.
+     * The atomic reference of the current state of the future.
      */
-    private final Object lock = new Object();
+    private final AtomicReference<State> stateRef = new AtomicReference<>(State.PENDING);
 
     /**
-     * The list of the future completion handlers.
+     * The read/write lock that allows efficient reads for completion and failure handlers.
      */
-    private final List<Consumer<T>> completionHandlers = new CopyOnWriteArrayList<>();
+    private final ReadWriteLock handlersLock = new ReentrantReadWriteLock();
 
     /**
-     * The list of the future failure handlers.
+     * The special object that is used for coordinating waiting threads.
      */
-    private final List<Consumer<Throwable>> errorHandlers = new CopyOnWriteArrayList<>();
+    private final Object waitLock = new Object();
+
+    /**
+     * The list of future completion handlers.
+     */
+    private final List<Consumer<T>> completionHandlers = new ArrayList<>();
+
+    /**
+     * The list of future failure handlers.
+     */
+    private final List<Consumer<Throwable>> errorHandlers = new ArrayList<>();
 
     /**
      * The value of the completion result. Only valid when state is COMPLETED.
@@ -111,11 +126,6 @@ public class Future<T> implements Promise<T> {
      * Only valid when state is FAILED.
      */
     private volatile @Nullable Throwable error;
-
-    /**
-     * The current state of the Future.
-     */
-    private volatile State state = State.PENDING;
 
     /**
      * Creates a new, incomplete Future.
@@ -354,13 +364,15 @@ public class Future<T> implements Promise<T> {
      * @see #getOrDefault(long, Object)
      */
     @CheckReturnValue
-    private synchronized T blockForValue(
+    private T blockForValue(
         long timeout, boolean hasDefault, @Nullable T defaultValue
     ) throws FutureTimeoutException, FutureExecutionException {
+        State currentState = getState();
+
         // check if the future is already completed
-        if (state != State.PENDING) {
+        if (!isPendingLike(currentState)) {
             // check if the completion was successful
-            if (state == State.COMPLETED)
+            if (currentState == State.COMPLETED)
                 return value;
 
             // completion was unsuccessful
@@ -369,28 +381,46 @@ public class Future<T> implements Promise<T> {
                 return defaultValue;
 
             // no default value set, throw the completion error
-            throw new FutureExecutionException(error);
+            Throwable cause = error;
+            assert cause != null : "Expected Future#cause to be not null";
+            throw new FutureExecutionException(cause);
         }
 
         // the future is not yet completed
-        // ensure the lock is not used externally
-        synchronized (lock) {
-            try {
-                // freeze the current thread until the future completion occurs
-                // wait for the completion notification
-                lock.wait(timeout);
-            } catch (InterruptedException ignored) {
-                // ignore if the completion thread was interrupted
+        // use shared waitLock for coordination
+        long deadlineNanos = timeout > 0 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout) : 0;
+        synchronized (waitLock) {
+            while (isPendingLike(currentState)) {
+                try {
+                    if (timeout == 0) {
+                        // wait indefinitely
+                        waitLock.wait(0);
+                    } else {
+                        long remainingNanos = deadlineNanos - System.nanoTime();
+                        if (remainingNanos <= 0)
+                            break;
+                        long millis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
+                        int nanos = (int) (remainingNanos - TimeUnit.MILLISECONDS.toNanos(millis));
+                        waitLock.wait(millis, nanos);
+                    }
+                } catch (InterruptedException ignored) {
+                    // ignore if the completion thread was interrupted
+                }
+                currentState = getState();
             }
         }
 
-        // check if the timeout has been exceeded, but the future hasn't been completed yet
-        if (state == State.PENDING)
+        // check final state after waiting
+        if (timeout > 0 && isPendingLike(currentState))
+            throw new FutureTimeoutException(timeout);
+
+        currentState = getState();
+        if (currentState == State.PENDING)
             throw new FutureTimeoutException(timeout);
 
         // the future has been completed
         // check if the completion was successful
-        if (state == State.COMPLETED)
+        if (currentState == State.COMPLETED)
             return value;
 
         // the completion was unsuccessful
@@ -399,7 +429,9 @@ public class Future<T> implements Promise<T> {
             return defaultValue;
 
         // no default value set, throw the completion error
-        throw new FutureExecutionException(error);
+        Throwable cause = error;
+        assert cause != null : "Expected Future#cause to be not null";
+        throw new FutureExecutionException(cause);
     }
 
     /**
@@ -410,7 +442,7 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public T getNow(@Nullable T defaultValue) {
-        return state == State.COMPLETED ? value : defaultValue;
+        return getState() == State.COMPLETED ? value : defaultValue;
     }
 
     /**
@@ -432,7 +464,7 @@ public class Future<T> implements Promise<T> {
         // note that future can complete with `null`, for instance when running `Future<Void>.completed()`
         // java optional api enforces optional values not to be null, so for completed null values, we
         // will return an empty optional as well
-        return state == State.COMPLETED && value != null ? Optional.of(value) : Optional.empty();
+        return getState() == State.COMPLETED && value != null ? Optional.of(value) : Optional.empty();
     }
 
     /**
@@ -440,6 +472,7 @@ public class Future<T> implements Promise<T> {
      * Call all the callbacks waiting on the completion of this Future.
      * <p>
      * If this Future was already completed (either successful or unsuccessful), this method does nothing.
+     * Handler exceptions are collected and rethrown after all handlers run.
      *
      * @param value the completion value
      * @return <code>true</code> if the Future was completed with the value,
@@ -449,28 +482,39 @@ public class Future<T> implements Promise<T> {
     public boolean complete(@Nullable T value) {
         List<Consumer<T>> handlers;
 
-        // set the completion value and unlock the waiting thread
-        synchronized (lock) {
-            // check if the future is already completed
-            if (state != State.PENDING)
-                return false;
+        // ignore failure if the future is not pending anymore
+        if (!compareAndSetState(State.PENDING, State.COMPLETING))
+            return false;
 
-            this.value = value;
-            state = State.COMPLETED;
-            lock.notify();
+        // set value before publishing the final state
+        this.value = value;
+        setState(State.COMPLETED);
 
-            // capture handlers to execute outside lock to prevent deadlocks
+        // notify waiting threads
+        synchronized (waitLock) {
+            waitLock.notifyAll();
+        }
+
+        // capture handlers with read lock for efficiency
+        handlersLock.readLock().lock();
+        try {
             handlers = new ArrayList<>(completionHandlers);
+        } finally {
+            handlersLock.readLock().unlock();
         }
 
         // call the completion handlers outside synchronized block
+        Throwable handlerError = null;
         for (Consumer<T> handler : handlers) {
             try {
                 handler.accept(value);
             } catch (Throwable e) {
-                throw new FutureRuntimeException("Unexpected exception caught in completion handler", e);
+                if (handlerError == null)
+                    handlerError = e;
             }
         }
+        if (handlerError != null)
+            throw new FutureRuntimeException("Unexpected exception caught in completion handler", handlerError);
 
         return true;
     }
@@ -480,6 +524,7 @@ public class Future<T> implements Promise<T> {
      * Call all the callbacks waiting on the failure of this Future.
      * <p>
      * If this Future was already completed (either successful or unsuccessful), this method does nothing.
+     * Handler exceptions are collected and rethrown after all handlers run.
      *
      * @param error the error occurred whilst completing
      * @return <code>true</code> if the Future was completed with an error, <code>false</code> otherwise
@@ -488,28 +533,39 @@ public class Future<T> implements Promise<T> {
     public boolean fail(@NotNull Throwable error) {
         List<Consumer<Throwable>> handlers;
 
-        // set the error and unlock the waiting thread
-        synchronized (lock) {
-            // check if the future is already completed
-            if (state != State.PENDING)
-                return false;
+        // ignore failure if the future is not pending anymore
+        if (!compareAndSetState(State.PENDING, State.FAILING))
+            return false;
 
-            this.error = error;
-            state = State.FAILED;
-            lock.notify();
+        // set error before publishing the final state
+        this.error = error;
+        setState(State.FAILED);
 
-            // capture handlers to execute outside lock to prevent deadlocks
+        // notify waiting threads
+        synchronized (waitLock) {
+            waitLock.notifyAll();
+        }
+
+        // capture handlers with read lock for efficiency
+        handlersLock.readLock().lock();
+        try {
             handlers = new ArrayList<>(errorHandlers);
+        } finally {
+            handlersLock.readLock().unlock();
         }
 
         // call the failure handlers outside synchronized block
+        Throwable handlerError = null;
         for (Consumer<Throwable> handler : handlers) {
             try {
                 handler.accept(error);
             } catch (Throwable e) {
-                throw new FutureRuntimeException("Unexpected exception caught in failure handler", e);
+                if (handlerError == null)
+                    handlerError = e;
             }
         }
+        if (handlerError != null)
+            throw new FutureRuntimeException("Unexpected exception caught in failure handler", handlerError);
         return true;
     }
 
@@ -528,18 +584,12 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> then(@NotNull Consumer<T> action) {
-        synchronized (lock) {
-            // register the action if the Future hasn't been completed yet
-            if (state == State.PENDING)
-                completionHandlers.add(action);
-
-            // the Future is already completed
-            // call the callback if the completion was successful
-            else if (state == State.COMPLETED)
-                action.accept(value);
-
+        if (addCompletionHandlerIfPending(action))
             return this;
-        }
+
+        if (getState() == State.COMPLETED)
+            action.accept(value);
+        return this;
     }
 
     /**
@@ -557,29 +607,20 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> tryThen(@NotNull ThrowableConsumer<T, Throwable> action) {
-        synchronized (lock) {
-            // register the action if the Future hasn't been completed yet
-            if (state == State.PENDING)
-                completionHandlers.add(value -> {
-                    try {
-                        action.accept(value);
-                    } catch (Throwable e) {
-                        fail(e);
-                    }
-                });
-
-            // the Future is already completed
-            // call the callback if the completion was successful
-            else if (state == State.COMPLETED) {
-                try {
-                    action.accept(value);
-                } catch (Throwable e) {
-                    fail(e);
-                }
+        Consumer<T> handler = value -> {
+            try {
+                action.accept(value);
+            } catch (Throwable e) {
+                fail(e);
             }
+        };
 
+        if (addCompletionHandlerIfPending(handler))
             return this;
-        }
+
+        if (getState() == State.COMPLETED)
+            handler.accept(value);
+        return this;
     }
 
     /**
@@ -597,18 +638,13 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> thenAsync(@NotNull Consumer<T> action) {
-        synchronized (lock) {
-            // register the action if the Future hasn't been completed yet
-            if (state == State.PENDING)
-                completionHandlers.add(value -> executeLockedAsync(() -> action.accept(value)));
-
-            // the Future is already completed
-            // call the callback if the completion was successful
-            else if (state == State.COMPLETED)
-                executeLockedAsync(() -> action.accept(value));
-
+        Consumer<T> handler = value -> executeAsync(() -> action.accept(value));
+        if (addCompletionHandlerIfPending(handler))
             return this;
-        }
+
+        if (getState() == State.COMPLETED)
+            handler.accept(value);
+        return this;
     }
 
     /**
@@ -628,30 +664,32 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> thenInvoke(@NotNull Runnable task) {
-        synchronized (lock) {
-            Future<T> future = new Future<>();
+        Future<T> future = new Future<>();
+        State currentState = getState();
 
-            if (state != State.PENDING) {
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    future.fail(error);
-                } else {
+        if (currentState == State.PENDING) {
+            boolean registered = addHandlersIfPending(
+                value -> {
                     task.run();
                     future.complete(value);
-                }
-            }
-
-            else {
-                completionHandlers.add(value -> {
-                    task.run();
-                    future.complete(value);
-                });
-                errorHandlers.add(future::fail);
-            }
-
-            return future;
+                },
+                future::fail
+            );
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            future.fail(error);
+        } else {
+            task.run();
+            future.complete(value);
+        }
+
+        return future;
     }
 
     /**
@@ -673,39 +711,41 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> thenTryInvoke(@NotNull ThrowableRunnable<Throwable> task) {
-        synchronized (lock) {
-            Future<T> future = new Future<>();
+        Future<T> future = new Future<>();
+        State currentState = getState();
 
-            if (state != State.PENDING) {
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    future.fail(error);
-                }
-                else {
+        if (currentState == State.PENDING) {
+            boolean registered = addHandlersIfPending(
+                value -> {
                     try {
                         task.run();
                         future.complete(value);
                     } catch (Throwable e) {
                         future.fail(e);
                     }
-                }
-            }
-
-            else {
-                completionHandlers.add(value -> {
-                    try {
-                        task.run();
-                        future.complete(value);
-                    } catch (Throwable e) {
-                        future.fail(e);
-                    }
-                });
-                errorHandlers.add(future::fail);
-            }
-
-            return future;
+                },
+                future::fail
+            );
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            future.fail(error);
+        }
+        else {
+            try {
+                task.run();
+                future.complete(value);
+            } catch (Throwable e) {
+                future.fail(e);
+            }
+        }
+
+        return future;
     }
 
     /**
@@ -727,43 +767,31 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> transform(@NotNull Function<T, U> transformer) {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                // try to transform the future value
-                try {
-                    return completed(transformer.apply(value));
-                } catch (Exception e) {
-                    // unable to transform the Future, return a failed Future
-                    return failed(e);
-                }
-            }
-
-            // the future hasn't been completed yet, create a new Future
-            // that will try to transform the value once it is completed
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            // register the Future completion transformer
-            completionHandlers.add(value -> {
-                // try to transform the Future value
+            boolean registered = addHandlersIfPending(value -> {
                 try {
                     future.complete(transformer.apply(value));
                 } catch (Exception e) {
-                    // unable to transform the value, fail the Future
                     future.fail(e);
                 }
-            });
+            }, future::fail);
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            // register the error handler
-            errorHandlers.add(future::fail);
-            return future;
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        try {
+            return completed(transformer.apply(value));
+        } catch (Exception e) {
+            return failed(e);
         }
     }
 
@@ -785,43 +813,31 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> tryTransform(@NotNull ThrowableFunction<T, U, Throwable> transformer) {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                // try to transform the future value
-                try {
-                    return completed(transformer.apply(value));
-                } catch (Throwable e) {
-                    // unable to transform the Future, return a failed Future
-                    return failed(e);
-                }
-            }
-
-            // the future hasn't been completed yet, create a new Future
-            // that will try to transform the value once it is completed
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            // register the Future completion transformer
-            completionHandlers.add(value -> {
-                // try to transform the Future value
+            boolean registered = addHandlersIfPending(value -> {
                 try {
                     future.complete(transformer.apply(value));
                 } catch (Throwable e) {
-                    // unable to transform the value, fail the Future
                     future.fail(e);
                 }
-            });
+            }, future::fail);
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            // register the error handler
-            errorHandlers.add(future::fail);
-            return future;
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        try {
+            return completed(transformer.apply(value));
+        } catch (Throwable e) {
+            return failed(e);
         }
     }
 
@@ -850,43 +866,31 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> transformAsync(@NotNull Function<T, Future<U>> transformer) {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                // try to transform the future value
-                try {
-                    return transformer.apply(value);
-                } catch (Exception e) {
-                    // unable to transform the Future, return a failed Future
-                    return failed(e);
-                }
-            }
-
-            // the future hasn't been completed yet, create a new Future
-            // that will try to transform the value once it is completed
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            // register the Future completion transformer
-            completionHandlers.add(value -> {
-                // try to transform the Future value
+            boolean registered = addHandlersIfPending(value -> {
                 try {
                     transformer.apply(value).then(future::complete);
                 } catch (Exception e) {
-                    // unable to transform the value, fail the Future
                     future.fail(e);
                 }
-            });
+            }, future::fail);
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            // register the error handler
-            errorHandlers.add(future::fail);
-            return future;
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        try {
+            return transformer.apply(value);
+        } catch (Exception e) {
+            return failed(e);
         }
     }
 
@@ -909,43 +913,31 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> tryTransformAsync(@NotNull ThrowableFunction<T, Future<U>, Throwable> transformer) {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                // try to transform the future value
-                try {
-                    return transformer.apply(value);
-                } catch (Throwable e) {
-                    // unable to transform the Future, return a failed Future
-                    return failed(e);
-                }
-            }
-
-            // the future hasn't been completed yet, create a new Future
-            // that will try to transform the value once it is completed
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            // register the Future completion transformer
-            completionHandlers.add(value -> {
-                // try to transform the Future value
+            boolean registered = addHandlersIfPending(value -> {
                 try {
                     transformer.apply(value).then(future::complete);
                 } catch (Throwable e) {
-                    // unable to transform the value, fail the Future
                     future.fail(e);
                 }
-            });
+            }, future::fail);
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            // register the error handler
-            errorHandlers.add(future::fail);
-            return future;
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        try {
+            return transformer.apply(value);
+        } catch (Throwable e) {
+            return failed(e);
         }
     }
 
@@ -962,30 +954,22 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> to(@Nullable U value) {
-        synchronized (lock) {
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                else
-                    return completed(value);
-            }
-
-            // create a new Future that will supply the specified value
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            // supply the value when this Future completes
-            completionHandlers.add(ignored -> future.complete(value));
-
-            // proxy the error to the new Future
-            errorHandlers.add(future::fail);
-
-            return future;
+            boolean registered = addHandlersIfPending(ignored -> future.complete(value), future::fail);
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        return completed(value);
     }
 
     /**
@@ -1004,26 +988,22 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> to(@NotNull Supplier<@Nullable U> supplier) {
-        synchronized (lock) {
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                else
-                    return completed(supplier.get());
-            }
-
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            completionHandlers.add(value -> future.complete(supplier.get()));
-            errorHandlers.add(future::fail);
-
-            return future;
+            boolean registered = addHandlersIfPending(value -> future.complete(supplier.get()), future::fail);
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        return completed(supplier.get());
     }
 
     /**
@@ -1042,33 +1022,31 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> tryTo(@NotNull ThrowableSupplier<U, Throwable> supplier) {
-        synchronized (lock) {
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                try {
-                    return completed(supplier.get());
-                } catch (Throwable error) {
-                    return failed(error);
-                }
-            }
-
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            completionHandlers.add(value -> {
+            boolean registered = addCompletionHandlerIfPending(value -> {
                 try {
                     future.complete(supplier.get());
                 } catch (Throwable error) {
                     future.fail(error);
                 }
             });
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            return future;
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        try {
+            return completed(supplier.get());
+        } catch (Throwable error) {
+            return failed(error);
         }
     }
 
@@ -1088,32 +1066,28 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> toAsync(@NotNull Supplier<U> supplier) {
-        synchronized (lock) {
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                try {
-                    return completed(supplier.get());
-                } catch (Throwable error) {
-                    return failed(error);
-                }
-            }
-
-            // create a new Future that will supply the specified value
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
+            boolean registered = addHandlersIfPending(
+                ignored -> Future.supplyAsync(supplier).then(future::complete),
+                future::fail
+            );
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            // supply the value when this Future completes
-            completionHandlers.add(ignored -> Future.supplyAsync(supplier).then(future::complete));
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
 
-            // proxy the error to the new Future
-            errorHandlers.add(future::fail);
-
-            return future;
+        try {
+            return completed(supplier.get());
+        } catch (Throwable error) {
+            return failed(error);
         }
     }
 
@@ -1133,34 +1107,30 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> tryToAsync(@NotNull ThrowableSupplier<U, Throwable> supplier) {
-        synchronized (lock) {
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                try {
-                    return completed(supplier.get());
-                } catch (Throwable error) {
-                    return failed(error);
-                }
-            }
-
-            // create a new Future that will supply the specified value
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
+            boolean registered = addHandlersIfPending(
+                ignored -> Future.trySupplyAsync(supplier)
+                    .then(future::complete)
+                    .except(future::fail),
+                future::fail
+            );
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            // try to supply the value when this Future completes
-            completionHandlers.add(ignored -> Future.trySupplyAsync(supplier)
-                .then(future::complete)
-                .except(future::fail));
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
 
-            // proxy the error to the new Future
-            errorHandlers.add(future::fail);
-
-            return future;
+        try {
+            return completed(supplier.get());
+        } catch (Throwable error) {
+            return failed(error);
         }
     }
 
@@ -1179,34 +1149,25 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public @NotNull Future<Void> callback() {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // check if the completion was unsuccessful
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                // try to transform the future value
-                try {
-                    return completed();
-                } catch (Exception e) {
-                    // unable to transform the Future, return a failed Future
-                    return failed(e);
-                }
-            }
-
-            // the future hasn't been completed yet, create a new Future
-            // that will try to transform the value once it is completed
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<Void> future = new Future<>();
-            // register the Future completion transformer
-            completionHandlers.add(value -> future.complete(null));
+            boolean registered = addHandlersIfPending(value -> future.complete(null), future::fail);
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            // register the error handler
-            errorHandlers.add(future::fail);
-            return future;
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        try {
+            return completed();
+        } catch (Exception e) {
+            return failed(e);
         }
     }
 
@@ -1244,22 +1205,19 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public @NotNull Future<Boolean> status() {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING)
-                return completed(state == State.COMPLETED);
-
-            // create a new Future that will be completed with the status of this Future
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<Boolean> future = new Future<>();
-
-            // complete the Future with true, if it completes successfully
-            completionHandlers.add(ignored -> future.complete(true));
-
-            // complete the Future with false, if it fails with an exception
-            errorHandlers.add(ignored -> future.complete(false));
-
-            return future;
+            boolean registered = addHandlersIfPending(
+                ignored -> future.complete(true),
+                ignored -> future.complete(false)
+            );
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        return completed(currentState == State.COMPLETED);
     }
 
     /**
@@ -1277,18 +1235,12 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> except(@NotNull Consumer<Throwable> action) {
-        synchronized (lock) {
-            // register the action if the Future hasn't been completed yet
-            if (state == State.PENDING)
-                errorHandlers.add(action);
-
-            // the Future is already completed
-            // call the callback if the completion was unsuccessful
-            else if (state == State.FAILED)
-                action.accept(error);
-
+        if (addErrorHandlerIfPending(action))
             return this;
-        }
+
+        if (getState() == State.FAILED)
+            action.accept(error);
+        return this;
     }
 
     /**
@@ -1306,29 +1258,20 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> tryExcept(@NotNull ThrowableConsumer<Throwable, Throwable> action) {
-        synchronized (lock) {
-            // register the action if the Future hasn't been completed yet
-            if (state == State.PENDING)
-                errorHandlers.add(error -> {
-                    try {
-                        action.accept(error);
-                    } catch (Throwable ignored) {
-                        // future is already failed, do not fail again
-                    }
-                });
-
-            // the Future is already completed
-            // call the callback if the completion was unsuccessful
-            else if (state == State.FAILED) {
-                try {
-                    action.accept(error);
-                } catch (Throwable ignored) {
-                    // future is already failed, do not fail again
-                }
+        Consumer<Throwable> handler = error -> {
+            try {
+                action.accept(error);
+            } catch (Throwable ignored) {
+                // future is already failed, do not fail again
             }
+        };
 
+        if (addErrorHandlerIfPending(handler))
             return this;
-        }
+
+        if (getState() == State.FAILED)
+            handler.accept(error);
+        return this;
     }
 
     /**
@@ -1346,18 +1289,13 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> exceptAsync(@NotNull Consumer<Throwable> action) {
-        synchronized (lock) {
-            // register the action if the Future hasn't been completed yet
-            if (state == State.PENDING)
-                errorHandlers.add(error -> executeLockedAsync(() -> action.accept(error)));
-
-            // the Future is already completed
-            // call the callback if the completion was unsuccessful
-            else if (state == State.FAILED)
-                executeLockedAsync(() -> action.accept(error));
-
+        Consumer<Throwable> handler = error -> executeAsync(() -> action.accept(error));
+        if (addErrorHandlerIfPending(handler))
             return this;
-        }
+
+        if (getState() == State.FAILED)
+            handler.accept(error);
+        return this;
     }
 
     /**
@@ -1394,41 +1332,31 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> fallback(@NotNull Function<Throwable, T> transformer) {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // check if the completion was successful
-                if (state == State.COMPLETED)
-                    return completed(value);
-
-                // try to transform the error to a value
-                try {
-                    return completed(transformer.apply(error));
-                } catch (Exception e) {
-                    // unable to transform the Future, return a failed Future
-                    return failed(e);
-                }
-            }
-
-            // the future hasn't been completed yet, create a new Future
-            // that will try to transform the error once it is failed
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<T> future = new Future<>();
-
-            // register the completion handler
-            completionHandlers.add(future::complete);
-
-            // register the error transformer
-            errorHandlers.add(error -> {
-                // try to transform the Future error
-                try {
-                    future.complete(transformer.apply(error));
-                } catch (Exception e) {
-                    // unable to transform the error, fail the Future
-                    future.fail(e);
+            boolean registered = addHandlersIfPending(
+                future::complete,
+                error -> {
+                    try {
+                        future.complete(transformer.apply(error));
+                    } catch (Exception e) {
+                        future.fail(e);
+                    }
                 }
-            });
+            );
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            return future;
+        if (currentState == State.COMPLETED)
+            return completed(value);
+
+        try {
+            return completed(transformer.apply(error));
+        } catch (Exception e) {
+            return failed(e);
         }
     }
 
@@ -1450,29 +1378,22 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> fallback(@Nullable T fallbackValue) {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // complete the Future with the fallback value if the
-                // current Future's completion was failed
-                if (state == State.FAILED)
-                    return completed(fallbackValue);
-
-                // the completion was successful, return the completion value
-                return completed(value);
-            }
-
-            // the future hasn't been completed yet, create a new Future
-            // that will use the fallback value if the current Future fails
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<T> future = new Future<>();
-
-            // register the completion handler
-            completionHandlers.add(future::complete);
-
-            // register the error fallback handler
-            errorHandlers.add(error -> future.complete(fallbackValue));
-            return future;
+            boolean registered = addHandlersIfPending(
+                future::complete,
+                error -> future.complete(fallbackValue)
+            );
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED)
+            return completed(fallbackValue);
+
+        return completed(value);
     }
 
     /**
@@ -1489,41 +1410,34 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> cast(@NotNull Class<U> type) {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // return a failed future if this future is already failed
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                // check if the completed value cannot be cast to the specified type
-                T value = this.value;
-                if (value != null && !value.getClass().isAssignableFrom(type))
-                    return failed(new ClassCastException(value.getClass() + " cannot be casted to " + type));
-
-                // return a completed future if this future is already completed
-                return completed(type.cast(value));
-            }
-
-            // the future hasn't been completed yet, create a new Future
-            // that will cast the completion value if the current Future completes
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            // register the completion handler
-            completionHandlers.add(value -> {
-                if (value != null && !value.getClass().isAssignableFrom(type))
-                    future.fail(new ClassCastException(value.getClass() + " cannot be casted to " + type));
-                else
-                    future.complete(type.cast(value));
-            });
-
-            // register the error fallback handler
-            errorHandlers.add(future::fail);
-            return future;
+            boolean registered = addHandlersIfPending(
+                value -> {
+                    if (value != null && !value.getClass().isAssignableFrom(type))
+                        future.fail(new ClassCastException(value.getClass() + " cannot be casted to " + type));
+                    else
+                        future.complete(type.cast(value));
+                },
+                future::fail
+            );
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        T value = this.value;
+        if (value != null && !value.getClass().isAssignableFrom(type))
+            return failed(new ClassCastException(value.getClass() + " cannot be casted to " + type));
+
+        return completed(type.cast(value));
     }
 
     /**
@@ -1553,19 +1467,19 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public @NotNull Future<T> result(@NotNull BiConsumer<T, Throwable> action) {
-        synchronized (lock) {
-            // call the action if the Future is already completed
-            if (state != State.PENDING) {
-                action.accept(value, error);
+        State currentState = getState();
+        if (currentState == State.PENDING) {
+            boolean registered = addHandlersIfPending(
+                value -> action.accept(value, null),
+                error -> action.accept(null, error)
+            );
+            if (registered)
                 return this;
-            }
-
-            // the Future hasn't been completed yet, register the callbacks
-            completionHandlers.add(value -> action.accept(value, null));
-            errorHandlers.add(error -> action.accept(null, error));
-
-            return this;
+            currentState = getState();
         }
+
+        action.accept(value, error);
+        return this;
     }
 
     /**
@@ -1597,44 +1511,34 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> result(@NotNull BiFunction<T, Throwable, U> transformer) {
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // try to transform the value and create a new Future with it
-                try {
-                    return completed(transformer.apply(value, error));
-                } catch (Exception e) {
-                    // unable to transform the error, create a Failed future
-                    return failed(e);
-                }
-            }
-
-            // the Future hasn't been completed yet, create a new one
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<U> future = new Future<>();
-
-            // register the completion transformer
-            completionHandlers.add(value -> {
-                // try to transform the value
-                try {
-                    future.complete(transformer.apply(value, null));
-                } catch (Exception e) {
-                    // unable to transform the error, fail the Future
-                    future.fail(e);
+            boolean registered = addHandlersIfPending(
+                value -> {
+                    try {
+                        future.complete(transformer.apply(value, null));
+                    } catch (Exception e) {
+                        future.fail(e);
+                    }
+                },
+                error -> {
+                    try {
+                        future.complete(transformer.apply(null, error));
+                    } catch (Exception e) {
+                        future.fail(e);
+                    }
                 }
-            });
+            );
+            if (registered)
+                return future;
+            currentState = getState();
+        }
 
-            // register the failure transformer
-            errorHandlers.add(error -> {
-                // try to transform the error
-                try {
-                    future.complete(transformer.apply(null, error));
-                } catch (Exception e) {
-                    // unable to transform the error, fail the Future
-                    future.fail(e);
-                }
-            });
-
-            return future;
+        try {
+            return completed(transformer.apply(value, error));
+        } catch (Exception e) {
+            return failed(e);
         }
     }
 
@@ -1647,37 +1551,33 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public @NotNull Future<T> filter(@NotNull Predicate<T> predicate, @NotNull Supplier<Throwable> error) {
-        synchronized (lock) {
-            // check if the future is already completed
-            if (state != State.PENDING) {
-                // fail the future it was already failed
-                if (state == State.FAILED) {
-                    Throwable completedError = this.error;
-                    assert completedError != null;
-                    return failed(completedError);
-                }
-
-                // fail the future if the predicate did not pass
-                if (!predicate.test(value))
-                    return failed(error.get());
-
-                return completed(value);
-            }
-
-            // create a future that will fail if the predicate fails the completion value
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<T> future = new Future<>();
-
-            completionHandlers.add(value -> {
-                if (predicate.test(value))
-                    future.complete(value);
-                else
-                    future.fail(error.get());
-            });
-
-            errorHandlers.add(future::fail);
-
-            return future;
+            boolean registered = addHandlersIfPending(
+                value -> {
+                    if (predicate.test(value))
+                        future.complete(value);
+                    else
+                        future.fail(error.get());
+                },
+                future::fail
+            );
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable completedError = this.error;
+            assert completedError != null;
+            return failed(completedError);
+        }
+
+        if (!predicate.test(value))
+            return failed(error.get());
+
+        return completed(value);
     }
 
     /**
@@ -1714,39 +1614,31 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public @NotNull Future<T> failIf(Function<T, @Nullable Throwable> predicate) {
-        synchronized (lock) {
-            // check if the future is already completed
-            if (state != State.PENDING) {
-                // check if the future is already failed
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                // run the predicate and test if the future should fail
-                Throwable error = predicate.apply(value);
-                if (error != null)
-                    return failed(error);
-
-                // future passed the predicate, return the completion value
-                return completed(value);
-            }
-
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<T> future = new Future<>();
-
-            // the future isn't completed yet
-            completionHandlers.add(value -> {
-                // run the predicate and test if the future should fail
+            boolean registered = addCompletionHandlerIfPending(value -> {
                 Throwable error = predicate.apply(value);
                 if (error != null)
                     future.fail(error);
-                // future passed the predicate, complete with the value
                 future.complete(value);
             });
-
-            return future;
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        Throwable error = predicate.apply(value);
+        if (error != null)
+            return failed(error);
+
+        return completed(value);
     }
 
     /**
@@ -1761,39 +1653,31 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public @NotNull Future<T> failIf(BiFunction<T, Throwable, @Nullable Throwable> predicate) {
-        synchronized (lock) {
-            // check if the future is already completed
-            if (state != State.PENDING) {
-                // check if the future is already failed
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    return failed(error);
-                }
-
-                // run the predicate and test if the future should fail
-                Throwable error = predicate.apply(value, this.error);
-                if (error != null)
-                    return failed(error);
-
-                // future passed the predicate, return the completion value
-                return completed(value);
-            }
-
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             Future<T> future = new Future<>();
-
-            // the future isn't completed yet
-            completionHandlers.add(value -> {
-                // run the predicate and test if the future should fail
+            boolean registered = addCompletionHandlerIfPending(value -> {
                 Throwable error = predicate.apply(value, this.error);
                 if (error != null)
                     future.fail(error);
-                // future passed the predicate, complete with the value
                 future.complete(value);
             });
-
-            return future;
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            return failed(error);
+        }
+
+        Throwable error = predicate.apply(value, this.error);
+        if (error != null)
+            return failed(error);
+
+        return completed(value);
     }
 
     /**
@@ -1808,50 +1692,37 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public @NotNull Future<T> timeout(long timeout) {
-        synchronized (lock) {
-            // create a new Future to send the timeout result to
-            Future<T> future = new Future<>();
-            // check if the future is already completed
-            if (state != State.PENDING) {
-                // check if the completion was successful
-                if (state == State.COMPLETED)
-                    return completed(value);
-
-                // future was failed, retrieve the error
-                Throwable error = this.error;
-                assert error != null;
-                return failed(error);
-            }
-
-            // create a new thread to run the timeout countdown on
+        Future<T> future = new Future<>();
+        State currentState = getState();
+        if (currentState == State.PENDING) {
             ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-            // register the completion handler
-            completionHandlers.add(value -> {
-                // complete the timeout future
-                future.complete(value);
-                // shutdown the timeout task
-                executor.shutdownNow();
-            });
-
-            // register the error handler
-            errorHandlers.add(error -> {
-                // fail the timeout future
-                future.fail(error);
-                // shutdown the timeout task
-                executor.shutdownNow();
-            });
-
-            // execute the completion using the timeout delay
-            executor.schedule(() -> {
-                // fail the future if it hasn't been completed yet, and the
-                // timeout limit has exceeded
-                future.fail(new FutureTimeoutException(timeout));
-                // execution has been finished, shutdown the executor
-                executor.shutdown();
-
-            }, timeout, TimeUnit.MILLISECONDS);
-            return future;
+            boolean registered = addHandlersIfPending(
+                value -> {
+                    future.complete(value);
+                    executor.shutdownNow();
+                },
+                error -> {
+                    future.fail(error);
+                    executor.shutdownNow();
+                }
+            );
+            if (registered) {
+                executor.schedule(() -> {
+                    future.fail(new FutureTimeoutException(timeout));
+                    executor.shutdown();
+                }, timeout, TimeUnit.MILLISECONDS);
+                return future;
+            }
+            executor.shutdownNow();
+            currentState = getState();
         }
+
+        if (currentState == State.COMPLETED)
+            return completed(value);
+
+        Throwable error = this.error;
+        assert error != null;
+        return failed(error);
     }
 
     /**
@@ -1876,32 +1747,25 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public @NotNull Future<T> mock() {
-        synchronized (lock) {
-            // create a new Future
-            Future<T> future = new Future<>();
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // check if the completion was failed
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    future.fail(error);
-                }
-                    // handle successful completion
-                else
-                    future.complete(value);
-            }
-
-            // the Future hasn't been completed yet
-            else {
-                // register the completion handler
-                completionHandlers.add(future::complete);
-                // register the error handler
-                errorHandlers.add(future::fail);
-            }
-
-            return future;
+        Future<T> future = new Future<>();
+        State currentState = getState();
+        if (currentState == State.PENDING) {
+            boolean registered = addHandlersIfPending(future::complete, future::fail);
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            future.fail(error);
+        }
+        else {
+            future.complete(value);
+        }
+
+        return future;
     }
 
     /**
@@ -1926,35 +1790,30 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public <U> @NotNull Future<T> chain(@NotNull Future<U> other) {
-        synchronized (lock) {
-            Future<T> future = new Future<>();
-
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                // do not complete other Future if this Future fails
-                if (state == State.FAILED) {
-                    Throwable error = this.error;
-                    assert error != null;
-                    future.fail(error);
-                }
-                // try to complete other Future if this Future was already completed
-                else other
-                    .then(ignored -> future.complete(this.value))
-                    .except(future::fail);
-            }
-
-            // Future hasn't been completed yet
-            else {
-                // try to complete other Future, when this Future will complete
-                completionHandlers.add(value -> other
+        Future<T> future = new Future<>();
+        State currentState = getState();
+        if (currentState == State.PENDING) {
+            boolean registered = addHandlersIfPending(
+                value -> other
                     .then(ignored -> future.complete(value))
-                    .except(future::fail));
-                // fail new Future if this Future fails
-                errorHandlers.add(future::fail);
-            }
-
-            return future;
+                    .except(future::fail),
+                future::fail
+            );
+            if (registered)
+                return future;
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED) {
+            Throwable error = this.error;
+            assert error != null;
+            future.fail(error);
+        }
+        else other
+            .then(ignored -> future.complete(this.value))
+            .except(future::fail);
+
+        return future;
     }
 
     /**
@@ -1966,7 +1825,7 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public boolean isCompleted() {
-        return state != State.PENDING;
+        return getState() != State.PENDING;
     }
 
     /**
@@ -1978,7 +1837,7 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public boolean isFailed() {
-        return state == State.FAILED;
+        return getState() == State.FAILED;
     }
 
     /**
@@ -1993,36 +1852,143 @@ public class Future<T> implements Promise<T> {
      */
     public @NotNull CompletableFuture<T> toJavaFuture() {
         CompletableFuture<T> future = new CompletableFuture<>();
-        synchronized (lock) {
-            // check if the Future is already completed
-            if (state != State.PENDING) {
-                if (state == State.FAILED)
-                    future.completeExceptionally(error);
-                else
-                    future.complete(value);
+        State currentState = getState();
+        if (currentState == State.PENDING) {
+            boolean registered = addHandlersIfPending(future::complete, future::completeExceptionally);
+            if (registered)
                 return future;
-            }
-
-            // handle pending Future completion
-            completionHandlers.add(future::complete);
-            errorHandlers.add(future::completeExceptionally);
+            currentState = getState();
         }
+
+        if (currentState == State.FAILED)
+            future.completeExceptionally(error);
+        else
+            future.complete(value);
         return future;
     }
 
     /**
-     * Perform a task whilst the value is locked.
+     * Perform a task asynchronously on the context executor.
      *
      * @param task the task to perform
      */
-    private void executeLockedAsync(@NotNull Runnable task) {
+    private void executeAsync(@NotNull Runnable task) {
         // use the executor of the caller's context to run the task on
-        getExecutor(Thread.currentThread().getStackTrace()).execute(() -> {
-            // lock the Future operations and run the task
-            synchronized (lock) {
-                task.run();
-            }
-        });
+        getExecutor(Thread.currentThread().getStackTrace()).execute(task);
+    }
+
+    /**
+     * Get the current future state atomically.
+     */
+    private State getState() {
+        State state = stateRef.get();
+        while (state == State.COMPLETING || state == State.FAILING) {
+            Threading.onSpinWait();
+            state = stateRef.get();
+        }
+        return state;
+    }
+
+    /**
+     * Get the public status of this Future.
+     *
+     * @return the stable status (pending, completed, failed)
+     */
+    public @NotNull Status getStatus() {
+        State state = getState();
+        switch (state) {
+            case COMPLETED:
+                return Status.COMPLETED;
+            case FAILED:
+                return Status.FAILED;
+            default:
+                return Status.PENDING;
+        }
+    }
+
+    /**
+     * Compare and set the future state atomically.
+     */
+    private boolean compareAndSetState(State expected, State newState) {
+        return stateRef.compareAndSet(expected, newState);
+    }
+
+    /**
+     * Update the future state atomically.
+     */
+    private void setState(State newState) {
+        stateRef.set(newState);
+    }
+
+    private boolean isPendingLike(State state) {
+        return state == State.PENDING || state == State.COMPLETING || state == State.FAILING;
+    }
+
+    /**
+     * Register a completion handler while blocking writes against handlers.
+     * <p>
+     * It will register the handler if and only if the Future is still pending.
+     *
+     * @param handler the handler to register
+     * @return {@code true} if the handler was registered, {@code false} otherwise
+     */
+    private boolean addCompletionHandlerIfPending(@NotNull Consumer<T> handler) {
+        handlersLock.writeLock().lock();
+        try {
+            if (getState() != State.PENDING)
+                return false;
+            completionHandlers.add(handler);
+            return true;
+        } finally {
+            handlersLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Register a failure handler while blocking writes against handlers.
+     * <p>
+     * It will register the handler if and only if the Future is still pending.
+     *
+     * @param handler the handler to register
+     * @return {@code true} if the handler was registered, {@code false} otherwise
+     */
+    private boolean addErrorHandlerIfPending(@NotNull Consumer<Throwable> handler) {
+        handlersLock.writeLock().lock();
+        try {
+            if (getState() != State.PENDING)
+                return false;
+            errorHandlers.add(handler);
+            return true;
+        } finally {
+            handlersLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Register a completion and a failure handler while blocking writes against handlers.
+     * <p>
+     * It will register the handler if and only if the Future is still pending.
+     *
+     * @param completionHandler the associated completion handler
+     * @param errorHandler the associated failure handler
+     * @return {@code true} if the handler was registered, {@code false} otherwise
+     */
+    private boolean addHandlersIfPending(
+        @Nullable Consumer<T> completionHandler,
+        @Nullable Consumer<Throwable> errorHandler
+    ) {
+        handlersLock.writeLock().lock();
+        try {
+            if (getState() != State.PENDING)
+                return false;
+            if (completionHandler != null)
+                completionHandlers.add(completionHandler);
+            if (errorHandler != null)
+                errorHandlers.add(errorHandler);
+            return true;
+        } finally {
+            handlersLock.writeLock().unlock();
+        }
     }
 
     /**
@@ -2040,7 +2006,7 @@ public class Future<T> implements Promise<T> {
 
         // set the future state
         future.value = value;
-        future.state = State.COMPLETED;
+        future.setState(State.COMPLETED);
 
         return future;
     }
@@ -2056,7 +2022,7 @@ public class Future<T> implements Promise<T> {
         Future<Void> future = new Future<>();
 
         // set the future state
-        future.state = State.COMPLETED;
+        future.setState(State.COMPLETED);
 
         return future;
     }
@@ -2075,7 +2041,7 @@ public class Future<T> implements Promise<T> {
 
         // set the future state
         future.error = error;
-        future.state = State.FAILED;
+        future.setState(State.FAILED);
 
         return future;
     }
