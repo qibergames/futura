@@ -50,14 +50,14 @@ public class Future<T> implements Promise<T> {
      */
     @Setter
     @Getter
-    private static @NotNull ExecutorService globalExecutor = Threading.createVirtualOrPool(
+    private static ExecutorService globalExecutor = Threading.createVirtualOrPool(
         Runtime.getRuntime().availableProcessors()
     );
 
     /**
      * The map of executors that should be used for the specified contexts.
      */
-    private static final @NotNull Map<@NotNull Object, @Nullable ExecutorService> contextExecutors = new MapMaker()
+    private static final Map<Object, ExecutorService> contextExecutors = new MapMaker()
         .weakKeys()
         .weakValues()
         .concurrencyLevel(4)
@@ -68,51 +68,54 @@ public class Future<T> implements Promise<T> {
      * multiple classes together, and cache a shared executor for each.
      */
     @Setter
-    private static @NotNull Function<@NotNull Class<?>, @NotNull Object> contextKeyMapper = Class::getClassLoader;
+    private static @NotNull Function<Class<?>, Object> contextKeyMapper = Class::getClassLoader;
 
     /**
      * The function that resolves an executor for the specified key. The key is resolved from the class by the
      * {@link #contextKeyMapper} function.
      */
     @Setter
-    private static @NotNull Function<@NotNull Object, @Nullable ExecutorService> contextExecutorMapper = key -> globalExecutor;
+    private static @NotNull Function<Object, ExecutorService> contextExecutorMapper = key -> globalExecutor;
+
+    /**
+     * State enumeration for Future lifecycle management.
+     */
+    private enum State {
+        PENDING,
+        COMPLETED,
+        FAILED
+    }
 
     /**
      * The object used for thread locking for unsafe value modifications.
      */
-    private final @NotNull Object lock = new Object();
+    private final Object lock = new Object();
 
     /**
      * The list of the future completion handlers.
      */
-    private final @NotNull List<@NotNull Consumer<@Nullable T>> completionHandlers = new CopyOnWriteArrayList<>();
+    private final List<Consumer<T>> completionHandlers = new CopyOnWriteArrayList<>();
 
     /**
      * The list of the future failure handlers.
      */
-    private final @NotNull List<@NotNull Consumer<@NotNull Throwable>> errorHandlers = new CopyOnWriteArrayList<>();
+    private final List<Consumer<Throwable>> errorHandlers = new CopyOnWriteArrayList<>();
 
     /**
-     * The value of the completion result. Initially <code>null</code>, it is set to the completion object
-     * after the completion is finished (which might still be <code>null</code>).
+     * The value of the completion result. Only valid when state is COMPLETED.
      */
     private volatile @Nullable T value;
 
     /**
      * The error that occurred whilst executing and caused a future failure.
-     * Initially <code>null</code>, after a failure, it is guaranteed to be non-null.
+     * Only valid when state is FAILED.
      */
     private volatile @Nullable Throwable error;
 
     /**
-     * Indicates whether the future completion had been done (either successfully or unsuccessfully).
+     * The current state of the Future.
      */
-    private volatile boolean completed;
-
-    /**
-     * Indicates whether the future completion was failed.
-     */
-    private volatile boolean failed;
+    private volatile State state = State.PENDING;
 
     /**
      * Creates a new, incomplete Future.
@@ -355,9 +358,9 @@ public class Future<T> implements Promise<T> {
         long timeout, boolean hasDefault, @Nullable T defaultValue
     ) throws FutureTimeoutException, FutureExecutionException {
         // check if the future is already completed
-        if (completed) {
+        if (state != State.PENDING) {
             // check if the completion was successful
-            if (!failed)
+            if (state == State.COMPLETED)
                 return value;
 
             // completion was unsuccessful
@@ -382,12 +385,12 @@ public class Future<T> implements Promise<T> {
         }
 
         // check if the timeout has been exceeded, but the future hasn't been completed yet
-        if (!completed)
+        if (state == State.PENDING)
             throw new FutureTimeoutException(timeout);
 
         // the future has been completed
         // check if the completion was successful
-        if (!failed)
+        if (state == State.COMPLETED)
             return value;
 
         // the completion was unsuccessful
@@ -407,7 +410,7 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public T getNow(@Nullable T defaultValue) {
-        return completed ? value : defaultValue;
+        return state == State.COMPLETED ? value : defaultValue;
     }
 
     /**
@@ -429,7 +432,7 @@ public class Future<T> implements Promise<T> {
         // note that future can complete with `null`, for instance when running `Future<Void>.completed()`
         // java optional api enforces optional values not to be null, so for completed null values, we
         // will return an empty optional as well
-        return completed && value != null ? Optional.of(value) : Optional.empty();
+        return state == State.COMPLETED && value != null ? Optional.of(value) : Optional.empty();
     }
 
     /**
@@ -444,38 +447,32 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public boolean complete(@Nullable T value) {
-        // check if the future is already completed
-        if (completed)
-            return false;
+        List<Consumer<T>> handlers;
 
         // set the completion value and unlock the waiting thread
         synchronized (lock) {
+            // check if the future is already completed
+            if (state != State.PENDING)
+                return false;
+
             this.value = value;
-            completed = true;
+            state = State.COMPLETED;
             lock.notify();
+
+            // capture handlers to execute outside lock to prevent deadlocks
+            handlers = new ArrayList<>(completionHandlers);
         }
 
-        // call the completion handlers
-        handleCompleted(value);
-        return true;
-    }
-
-    /**
-     * Try to call the completion handlers.
-     * @param value the completion value
-     */
-    private void handleCompleted(@Nullable T value) {
-        // call the completion handlers
-        for (Consumer<T> handler : completionHandlers) {
+        // call the completion handlers outside synchronized block
+        for (Consumer<T> handler : handlers) {
             try {
-                // try call the completion handler
                 handler.accept(value);
             } catch (Throwable e) {
-                // fail the completion
-                fail(e);
-                // TODO should the loop break here?
+                throw new FutureRuntimeException("Unexpected exception caught in completion handler", e);
             }
         }
+
+        return true;
     }
 
     /**
@@ -489,37 +486,31 @@ public class Future<T> implements Promise<T> {
      */
     @CanIgnoreReturnValue
     public boolean fail(@NotNull Throwable error) {
-        // check if the future is already completed
-        if (completed)
-            return false;
+        List<Consumer<Throwable>> handlers;
 
         // set the error and unlock the waiting thread
         synchronized (lock) {
+            // check if the future is already completed
+            if (state != State.PENDING)
+                return false;
+
             this.error = error;
-            completed = true;
-            failed = true;
+            state = State.FAILED;
             lock.notify();
+
+            // capture handlers to execute outside lock to prevent deadlocks
+            handlers = new ArrayList<>(errorHandlers);
         }
 
-        // call the failure handlers
-        handleFailed(error);
-        return true;
-    }
-
-    /**
-     * Try to call the completion handlers.
-     * @param error the error occurred whilst completing
-     */
-    private void handleFailed(@NotNull Throwable error) {
-        // call the completion handlers
-        for (Consumer<Throwable> handler : errorHandlers) {
+        // call the failure handlers outside synchronized block
+        for (Consumer<Throwable> handler : handlers) {
             try {
-                // try call the failure handler
                 handler.accept(error);
-            } catch (Throwable ignored) {
-                // TODO should it handle error handler exceptions?
+            } catch (Throwable e) {
+                throw new FutureRuntimeException("Unexpected exception caught in failure handler", e);
             }
         }
+        return true;
     }
 
     /**
@@ -539,12 +530,12 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> then(@NotNull Consumer<T> action) {
         synchronized (lock) {
             // register the action if the Future hasn't been completed yet
-            if (!completed)
+            if (state == State.PENDING)
                 completionHandlers.add(action);
 
             // the Future is already completed
             // call the callback if the completion was successful
-            else if (!failed)
+            else if (state == State.COMPLETED)
                 action.accept(value);
 
             return this;
@@ -568,7 +559,7 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> tryThen(@NotNull ThrowableConsumer<T, Throwable> action) {
         synchronized (lock) {
             // register the action if the Future hasn't been completed yet
-            if (!completed)
+            if (state == State.PENDING)
                 completionHandlers.add(value -> {
                     try {
                         action.accept(value);
@@ -579,7 +570,7 @@ public class Future<T> implements Promise<T> {
 
             // the Future is already completed
             // call the callback if the completion was successful
-            else if (!failed) {
+            else if (state == State.COMPLETED) {
                 try {
                     action.accept(value);
                 } catch (Throwable e) {
@@ -608,12 +599,12 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> thenAsync(@NotNull Consumer<T> action) {
         synchronized (lock) {
             // register the action if the Future hasn't been completed yet
-            if (!completed)
+            if (state == State.PENDING)
                 completionHandlers.add(value -> executeLockedAsync(() -> action.accept(value)));
 
             // the Future is already completed
             // call the callback if the completion was successful
-            else if (!failed)
+            else if (state == State.COMPLETED)
                 executeLockedAsync(() -> action.accept(value));
 
             return this;
@@ -640,8 +631,8 @@ public class Future<T> implements Promise<T> {
         synchronized (lock) {
             Future<T> future = new Future<>();
 
-            if (completed) {
-                if (failed) {
+            if (state != State.PENDING) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     future.fail(error);
@@ -685,8 +676,8 @@ public class Future<T> implements Promise<T> {
         synchronized (lock) {
             Future<T> future = new Future<>();
 
-            if (completed) {
-                if (failed) {
+            if (state != State.PENDING) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     future.fail(error);
@@ -738,9 +729,9 @@ public class Future<T> implements Promise<T> {
     public <U> @NotNull Future<U> transform(@NotNull Function<T, U> transformer) {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -796,9 +787,9 @@ public class Future<T> implements Promise<T> {
     public <U> @NotNull Future<U> tryTransform(@NotNull ThrowableFunction<T, U, Throwable> transformer) {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -861,9 +852,9 @@ public class Future<T> implements Promise<T> {
     public <U> @NotNull Future<U> transformAsync(@NotNull Function<T, Future<U>> transformer) {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -920,9 +911,9 @@ public class Future<T> implements Promise<T> {
     public <U> @NotNull Future<U> tryTransformAsync(@NotNull ThrowableFunction<T, Future<U>, Throwable> transformer) {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -972,9 +963,9 @@ public class Future<T> implements Promise<T> {
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> to(@Nullable U value) {
         synchronized (lock) {
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1014,9 +1005,9 @@ public class Future<T> implements Promise<T> {
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> to(@NotNull Supplier<@Nullable U> supplier) {
         synchronized (lock) {
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1052,9 +1043,9 @@ public class Future<T> implements Promise<T> {
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> tryTo(@NotNull ThrowableSupplier<U, Throwable> supplier) {
         synchronized (lock) {
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1098,9 +1089,9 @@ public class Future<T> implements Promise<T> {
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> toAsync(@NotNull Supplier<U> supplier) {
         synchronized (lock) {
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1143,9 +1134,9 @@ public class Future<T> implements Promise<T> {
     @CanIgnoreReturnValue
     public <U> @NotNull Future<U> tryToAsync(@NotNull ThrowableSupplier<U, Throwable> supplier) {
         synchronized (lock) {
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1190,9 +1181,9 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<Void> callback() {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was unsuccessful
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1255,8 +1246,8 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<Boolean> status() {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed)
-                return completed(!failed);
+            if (state != State.PENDING)
+                return completed(state == State.COMPLETED);
 
             // create a new Future that will be completed with the status of this Future
             Future<Boolean> future = new Future<>();
@@ -1288,12 +1279,12 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> except(@NotNull Consumer<Throwable> action) {
         synchronized (lock) {
             // register the action if the Future hasn't been completed yet
-            if (!completed)
+            if (state == State.PENDING)
                 errorHandlers.add(action);
 
             // the Future is already completed
             // call the callback if the completion was unsuccessful
-            else if (failed)
+            else if (state == State.FAILED)
                 action.accept(error);
 
             return this;
@@ -1317,7 +1308,7 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> tryExcept(@NotNull ThrowableConsumer<Throwable, Throwable> action) {
         synchronized (lock) {
             // register the action if the Future hasn't been completed yet
-            if (!completed)
+            if (state == State.PENDING)
                 errorHandlers.add(error -> {
                     try {
                         action.accept(error);
@@ -1328,7 +1319,7 @@ public class Future<T> implements Promise<T> {
 
             // the Future is already completed
             // call the callback if the completion was unsuccessful
-            else if (failed) {
+            else if (state == State.FAILED) {
                 try {
                     action.accept(error);
                 } catch (Throwable ignored) {
@@ -1357,12 +1348,12 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> exceptAsync(@NotNull Consumer<Throwable> action) {
         synchronized (lock) {
             // register the action if the Future hasn't been completed yet
-            if (!completed)
+            if (state == State.PENDING)
                 errorHandlers.add(error -> executeLockedAsync(() -> action.accept(error)));
 
             // the Future is already completed
             // call the callback if the completion was unsuccessful
-            else if (failed)
+            else if (state == State.FAILED)
                 executeLockedAsync(() -> action.accept(error));
 
             return this;
@@ -1405,9 +1396,9 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> fallback(@NotNull Function<Throwable, T> transformer) {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was successful
-                if (!failed)
+                if (state == State.COMPLETED)
                     return completed(value);
 
                 // try to transform the error to a value
@@ -1461,10 +1452,10 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> fallback(@Nullable T fallbackValue) {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // complete the Future with the fallback value if the
                 // current Future's completion was failed
-                if (failed)
+                if (state == State.FAILED)
                     return completed(fallbackValue);
 
                 // the completion was successful, return the completion value
@@ -1500,9 +1491,9 @@ public class Future<T> implements Promise<T> {
     public <U> @NotNull Future<U> cast(@NotNull Class<U> type) {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // return a failed future if this future is already failed
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1564,7 +1555,7 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> result(@NotNull BiConsumer<T, Throwable> action) {
         synchronized (lock) {
             // call the action if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 action.accept(value, error);
                 return this;
             }
@@ -1608,7 +1599,7 @@ public class Future<T> implements Promise<T> {
     public <U> @NotNull Future<U> result(@NotNull BiFunction<T, Throwable, U> transformer) {
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // try to transform the value and create a new Future with it
                 try {
                     return completed(transformer.apply(value, error));
@@ -1658,9 +1649,9 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> filter(@NotNull Predicate<T> predicate, @NotNull Supplier<Throwable> error) {
         synchronized (lock) {
             // check if the future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // fail the future it was already failed
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable completedError = this.error;
                     assert completedError != null;
                     return failed(completedError);
@@ -1725,9 +1716,9 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> failIf(Function<T, @Nullable Throwable> predicate) {
         synchronized (lock) {
             // check if the future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the future is already failed
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1772,9 +1763,9 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> failIf(BiFunction<T, Throwable, @Nullable Throwable> predicate) {
         synchronized (lock) {
             // check if the future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the future is already failed
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     return failed(error);
@@ -1821,9 +1812,9 @@ public class Future<T> implements Promise<T> {
             // create a new Future to send the timeout result to
             Future<T> future = new Future<>();
             // check if the future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was successful
-                if (!failed)
+                if (state == State.COMPLETED)
                     return completed(value);
 
                 // future was failed, retrieve the error
@@ -1889,9 +1880,9 @@ public class Future<T> implements Promise<T> {
             // create a new Future
             Future<T> future = new Future<>();
             // check if the Future is already completed
-            if (completed) {
+            if (state != State.PENDING) {
                 // check if the completion was failed
-                if (failed) {
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     future.fail(error);
@@ -1939,26 +1930,26 @@ public class Future<T> implements Promise<T> {
             Future<T> future = new Future<>();
 
             // check if the Future is already completed
-            if (completed) {
-                // do not complete the other Future if this Future fails
-                if (failed) {
+            if (state != State.PENDING) {
+                // do not complete other Future if this Future fails
+                if (state == State.FAILED) {
                     Throwable error = this.error;
                     assert error != null;
                     future.fail(error);
                 }
-                // try to complete the other Future if this Future was already completed
+                // try to complete other Future if this Future was already completed
                 else other
-                    .then(value -> future.complete(this.value))
+                    .then(ignored -> future.complete(this.value))
                     .except(future::fail);
             }
 
-            // the Future hasn't been completed yet
+            // Future hasn't been completed yet
             else {
-                // try to complete the other Future, when this Future will complete
+                // try to complete other Future, when this Future will complete
                 completionHandlers.add(value -> other
                     .then(ignored -> future.complete(value))
                     .except(future::fail));
-                // fail the new Future if this Future fails
+                // fail new Future if this Future fails
                 errorHandlers.add(future::fail);
             }
 
@@ -1975,7 +1966,7 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public boolean isCompleted() {
-        return completed;
+        return state != State.PENDING;
     }
 
     /**
@@ -1987,7 +1978,7 @@ public class Future<T> implements Promise<T> {
      */
     @CheckReturnValue
     public boolean isFailed() {
-        return failed;
+        return state == State.FAILED;
     }
 
     /**
@@ -2004,8 +1995,8 @@ public class Future<T> implements Promise<T> {
         CompletableFuture<T> future = new CompletableFuture<>();
         synchronized (lock) {
             // check if the Future is already completed
-            if (completed) {
-                if (failed)
+            if (state != State.PENDING) {
+                if (state == State.FAILED)
                     future.completeExceptionally(error);
                 else
                     future.complete(value);
@@ -2049,7 +2040,7 @@ public class Future<T> implements Promise<T> {
 
         // set the future state
         future.value = value;
-        future.completed = true;
+        future.state = State.COMPLETED;
 
         return future;
     }
@@ -2065,7 +2056,7 @@ public class Future<T> implements Promise<T> {
         Future<Void> future = new Future<>();
 
         // set the future state
-        future.completed = true;
+        future.state = State.COMPLETED;
 
         return future;
     }
@@ -2084,8 +2075,7 @@ public class Future<T> implements Promise<T> {
 
         // set the future state
         future.error = error;
-        future.completed = true;
-        future.failed = true;
+        future.state = State.FAILED;
 
         return future;
     }
