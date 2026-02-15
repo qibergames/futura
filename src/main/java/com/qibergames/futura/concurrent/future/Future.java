@@ -2033,6 +2033,17 @@ public class Future<T> implements Promise<T> {
     }
 
     /**
+     * Create a new incomplete Future, that is waiting for a completion.
+     *
+     * @return a new empty {@link Future}
+     * @param <T> the type of the Future
+     */
+    @CheckReturnValue
+    public static <T> @NotNull Future<T> incomplete() {
+        return new Future<>();
+    }
+
+    /**
      * Create a new Future, that is completed initially using the specified value.
      *
      * @param value the completion result
