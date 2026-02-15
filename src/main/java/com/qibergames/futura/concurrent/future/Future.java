@@ -410,12 +410,13 @@ public class Future<T> implements Promise<T> {
             }
         }
 
+        currentState = getState();
+
         // check final state after waiting
-        if (timeout > 0 && isPendingLike(currentState))
+        if (timeout > 0 && isPendingLike(currentState) && !hasDefault)
             throw new FutureTimeoutException(timeout);
 
-        currentState = getState();
-        if (currentState == State.PENDING)
+        if (currentState == State.PENDING && !hasDefault)
             throw new FutureTimeoutException(timeout);
 
         // the future has been completed
