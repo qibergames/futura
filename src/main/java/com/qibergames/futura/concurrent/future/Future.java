@@ -1681,6 +1681,45 @@ public class Future<T> implements Promise<T> {
     }
 
     /**
+     * Create a new Future, that will postpone completions by the given timeout.
+     * <p>
+     * The completion will be delayed for successful and failed completions.
+     * <p>
+     * If this Future is already completed, the new Future will also wait the given timeout before receiving completion.
+     *
+     * @param timeout the unit time to wait before calling the completion handlers
+     * @param unit the type of the timeout (milliseconds, seconds, etc.)
+     *
+     * @return a new {@link Future}
+     */
+    @CheckReturnValue
+    public @NotNull Future<T> delay(long timeout, @NotNull TimeUnit unit) {
+        Future<T> future = new Future<>();
+
+        try (ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor()) {
+            State currentState = getState();
+            if (currentState == State.PENDING) {
+                addHandlersIfPending(
+                    value -> scheduler.schedule(() -> future.complete(value), timeout, unit),
+                    error -> scheduler.schedule(() -> future.fail(error), timeout, unit)
+                );
+            }
+
+            currentState = getState();
+            if (currentState == State.COMPLETED)
+                scheduler.schedule(() -> future.complete(value), timeout, unit);
+            else if (currentState == State.FAILED)
+                scheduler.schedule(() -> {
+                    Throwable cause = error;
+                    assert cause != null : "Expected Future#cause to be not null";
+                    return future.fail(cause);
+                }, timeout, unit);
+        }
+
+        return future;
+    }
+
+    /**
      * Create a new Future, that will be completed unsuccessfully using a {@link FutureTimeoutException}
      * if the specified time has elapsed without a response. If this Future completes before the
      * timeout has passed, the new Future will be completed with this Future's result value.
