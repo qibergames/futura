@@ -1733,29 +1733,31 @@ public class Future<T> implements Promise<T> {
     public @NotNull Future<T> timeout(long timeout) {
         Future<T> future = new Future<>();
         State currentState = getState();
+
         if (currentState == State.PENDING) {
-            ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-            boolean registered = addHandlersIfPending(
-                value -> {
-                    future.complete(value);
-                    executor.shutdownNow();
-                },
-                error -> {
-                    future.fail(error);
-                    executor.shutdownNow();
+            try (ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor()) {
+                boolean registered = addHandlersIfPending(
+                    value -> {
+                        future.complete(value);
+                        executor.shutdownNow();
+                    },
+                    error -> {
+                        future.fail(error);
+                        executor.shutdownNow();
+                    }
+                );
+
+                if (registered) {
+                    executor.schedule(() -> {
+                        future.fail(new FutureTimeoutException(timeout));
+                        executor.shutdown();
+                    }, timeout, TimeUnit.MILLISECONDS);
+                    return future;
                 }
-            );
-            if (registered) {
-                executor.schedule(() -> {
-                    future.fail(new FutureTimeoutException(timeout));
-                    executor.shutdown();
-                }, timeout, TimeUnit.MILLISECONDS);
-                return future;
             }
-            executor.shutdownNow();
-            currentState = getState();
         }
 
+        currentState = getState();
         if (currentState == State.COMPLETED)
             return completed(value);
 
