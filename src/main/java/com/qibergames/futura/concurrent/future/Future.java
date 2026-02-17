@@ -604,24 +604,29 @@ public class Future<T> implements Promise<T> {
      * the completion value. If the Future failed with an exception, the action will not be called.
      *
      * @param action the successful completion callback
-     * @return this Future
+     * @return a new {@link Future}
      */
-    @CanIgnoreReturnValue
+    @CheckReturnValue
     public @NotNull Future<T> tryThen(@NotNull ThrowableConsumer<T, Throwable> action) {
+        // This method must create another Future, as otherwise the exception may be ignored in `action` if `this`
+        // Future is already completed, therefore `future.fail` will not run.
+        Future<T> future = Future.incomplete();
+
         Consumer<T> handler = value -> {
             try {
                 action.accept(value);
+                future.complete(value);
             } catch (Throwable e) {
-                fail(e);
+                future.fail(e);
             }
         };
 
         if (addCompletionHandlerIfPending(handler))
-            return this;
+            return future;
 
         if (getState() == State.COMPLETED)
             handler.accept(value);
-        return this;
+        return future;
     }
 
     /**
