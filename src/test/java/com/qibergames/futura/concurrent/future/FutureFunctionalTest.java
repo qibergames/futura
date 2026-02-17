@@ -2,7 +2,6 @@ package com.qibergames.futura.concurrent.future;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import lombok.SneakyThrows;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.TimeUnit;
@@ -12,7 +11,6 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public class FutureFunctionalTest {
     @Test
-    @SneakyThrows
     public void get() {
         completed: {
             Future<Integer> future = Future.completed(10);
@@ -39,11 +37,11 @@ public class FutureFunctionalTest {
     }
 
     @Test
-    @SneakyThrows
     public void getOrDefault() {
         deadline: {
             Future<Integer> future = Future.incomplete();
-            assertEquals(1234, future.getOrDefault(TimeUnit.SECONDS.toMillis(1), 1234));
+            long timeout = TimeUnit.SECONDS.toMillis(1);
+            assertEquals(1234, assertDoesNotThrow(() -> future.getOrDefault(timeout, 1234)));
         }
 
         failure: {
